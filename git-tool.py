@@ -8,7 +8,72 @@ import subprocess
 import sys
 import traceback
 
-VERSION = "v1.9 (Apr-2026)"
+VERSION = "v2.0 (Apr-2026)"
+
+
+# ---------------------------------------------------------------------------
+# Color support
+# ---------------------------------------------------------------------------
+
+_RED    = '\033[31m'
+_YELLOW = '\033[33m'
+_GREEN  = '\033[32m'
+_RESET  = '\033[0m'
+
+_USE_COLOR = False
+
+
+def _init_colors():
+    """Enable ANSI color output if the terminal supports it."""
+    global _USE_COLOR
+    if os.environ.get('NO_COLOR'):
+        return
+    if not sys.stdout.isatty():
+        return
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_ulong(0)
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            return
+    _USE_COLOR = True
+
+
+def _c(text, color):
+    """Wrap text in an ANSI color if colors are enabled."""
+    return f"{color}{text}{_RESET}" if _USE_COLOR else text
+
+
+def _is_dirty(s, unpushed):
+    """Return True if the repo has any non-clean status."""
+    if s is None:
+        return False
+    if s['error'] or s['behind'] or s['ahead']:
+        return True
+    total_staged   = (s['staged_added'] + s['staged_modified'] +
+                      s['staged_deleted'] + s['staged_renamed'])
+    total_unstaged = s['unstaged_modified'] + s['unstaged_deleted']
+    return bool(total_staged or total_unstaged or s['untracked'] or s['unmerged'] or unpushed)
+
+
+def _status_color(s, unpushed):
+    """Return the ANSI color code for a repo's status, or empty string."""
+    if s is None or not _USE_COLOR:
+        return ''
+    if s['error']:
+        return _RED
+    if s['behind']:
+        return _YELLOW
+    total_staged   = (s['staged_added'] + s['staged_modified'] +
+                      s['staged_deleted'] + s['staged_renamed'])
+    total_unstaged = s['unstaged_modified'] + s['unstaged_deleted']
+    if total_staged or total_unstaged or s['untracked'] or s['unmerged'] or s['ahead'] or unpushed:
+        return _GREEN
+    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -287,9 +352,10 @@ def get_count_objects(git_dir):
     return stats
 
 
-def format_size(git_dir, verbose):
+def format_size(git_dir, verbose, total_bytes=None):
     """Return indented lines describing .git storage size."""
-    total_bytes = get_git_dir_size(git_dir)
+    if total_bytes is None:
+        total_bytes = get_git_dir_size(git_dir)
     stats       = get_count_objects(git_dir)
 
     if total_bytes is None and stats is None:
@@ -333,6 +399,125 @@ def get_last_release(git_dir):
                            '--count=1',
                            'refs/tags')
     return stdout.strip() or None
+
+
+# ---------------------------------------------------------------------------
+# Summary collector
+# ---------------------------------------------------------------------------
+
+class SummaryCollector:
+    """Accumulate per-repo statistics for the end-of-run summary report."""
+
+    def __init__(self, repos_found):
+        self.repos_found     = repos_found
+        self.repos_processed = 0
+        self.total_size_bytes  = 0
+        self.largest_path    = None
+        self.largest_bytes   = 0
+        self.cnt_clean       = 0
+        self.cnt_error       = 0
+        self.cnt_pending     = 0
+        self.cnt_behind      = 0
+        self.cnt_main        = 0
+        self.cnt_master      = 0
+        self.cnt_with_tag    = 0
+        self.cnt_without_tag = 0
+        self.cnt_with_release    = 0
+        self.cnt_without_release = 0
+
+    def record(self, path, branch, status, unpushed, tag, release, size_bytes):
+        self.repos_processed += 1
+
+        if size_bytes is not None:
+            self.total_size_bytes += size_bytes
+            if size_bytes > self.largest_bytes:
+                self.largest_bytes = size_bytes
+                self.largest_path  = path
+
+        if status is not None:
+            if status['error']:
+                self.cnt_error += 1
+            else:
+                total_staged   = (status['staged_added'] + status['staged_modified'] +
+                                  status['staged_deleted'] + status['staged_renamed'])
+                total_unstaged = status['unstaged_modified'] + status['unstaged_deleted']
+                has_local      = (total_staged > 0 or total_unstaged > 0 or
+                                  status['untracked'] > 0 or status['unmerged'] > 0 or
+                                  status['ahead'] > 0 or bool(unpushed))
+                is_behind      = status['behind'] > 0
+                if not has_local and not is_behind:
+                    self.cnt_clean += 1
+                if has_local:
+                    self.cnt_pending += 1
+                if is_behind:
+                    self.cnt_behind += 1
+
+        if branch is not None:
+            if branch == 'main':
+                self.cnt_main += 1
+            elif branch == 'master':
+                self.cnt_master += 1
+
+        if tag is not None:
+            self.cnt_with_tag += 1
+        else:
+            self.cnt_without_tag += 1
+
+        if release is not None:
+            self.cnt_with_release += 1
+        else:
+            self.cnt_without_release += 1
+
+
+def print_summary_report(c):
+    """Print the end-of-run summary collected by a SummaryCollector."""
+    sep = '=' * 60
+    partial = c.repos_processed < c.repos_found
+    repo_label = 'repo' if c.repos_found == 1 else 'repos'
+    if partial:
+        header = f"Summary  ({c.repos_processed} of {c.repos_found} {repo_label} scanned)"
+    else:
+        header = f"Summary  ({c.repos_found} {repo_label})"
+
+    print(f"\n{sep}")
+    print(header)
+    print(sep)
+
+    # Size
+    print(f"  Total .git size:       {_fmt_bytes(c.total_size_bytes)}")
+    if c.largest_path:
+        name = os.path.basename(c.largest_path)
+        print(f"  Largest repo:          {name}  ({_fmt_bytes(c.largest_bytes)})")
+    print()
+
+    # Status counts
+    print(f"  Status:")
+    print(f"    Clean:               {c.cnt_clean}")
+    print(f"    Error:               {c.cnt_error}")
+    print(f"    Pending changes:     {c.cnt_pending}")
+    print(f"    Behind (need pull):  {c.cnt_behind}")
+    print()
+
+    # Branch counts
+    other_branch = c.repos_processed - c.cnt_main - c.cnt_master
+    print(f"  Branch:")
+    print(f"    main:                {c.cnt_main}")
+    print(f"    master:              {c.cnt_master}")
+    if other_branch > 0:
+        print(f"    other:               {other_branch}")
+    print()
+
+    # Tag counts
+    print(f"  Tags:")
+    print(f"    With tag:            {c.cnt_with_tag}")
+    print(f"    Without tag:         {c.cnt_without_tag}")
+    print()
+
+    # Release counts
+    print(f"  Releases:")
+    print(f"    With release:        {c.cnt_with_release}")
+    print(f"    Without release:     {c.cnt_without_release}")
+    print(sep)
 
 
 # ---------------------------------------------------------------------------
@@ -517,33 +702,51 @@ def cmd_clean(git_dirs, args):
 # Report
 # ---------------------------------------------------------------------------
 
-def report_repos(git_dirs, args):
+def report_repos(git_dirs, args, collector=None):
     """Print a labeled per-repo block for each active reporting flag."""
     for d in git_dirs:
-        print(d)
+        lines = []
 
+        current = None
         if args.branch:
             current, local_count, remote_count = get_branch_info(d)
-            print(f"  branch:  {current}  ({local_count} local, {remote_count} remote)")
+            lines.append(f"  branch:  {current}  ({local_count} local, {remote_count} remote)")
 
+        tag = None
         if args.tag:
             tag = get_last_tag(d)
-            print(f"  tag:     {tag or '(none)'}")
+            lines.append(f"  tag:     {tag or '(none)'}")
 
+        release = None
         if args.release:
-            rel = get_last_release(d)
-            print(f"  release: {rel or '(none)'}")
+            release = get_last_release(d)
+            lines.append(f"  release: {release or '(none)'}")
 
-        if args.status:
+        s = None
+        unpushed = None
+        if args.status or args.dirty:
             s        = get_repo_status(d)
             unpushed = get_unpushed_branches(d)
-            for line in format_status(s, unpushed, args.verbose):
-                print(line)
+            if args.status:
+                color = _status_color(s, unpushed)
+                for line in format_status(s, unpushed, args.verbose):
+                    lines.append(_c(line, color) if color else line)
 
+        size_bytes = None
         if args.size:
-            for line in format_size(d, args.verbose):
-                print(line)
+            size_bytes = get_git_dir_size(d)
+            for line in format_size(d, args.verbose, size_bytes):
+                lines.append(line)
 
+        if collector is not None:
+            collector.record(d, current, s, unpushed, tag, release, size_bytes)
+
+        if args.dirty and not _is_dirty(s, unpushed):
+            continue
+
+        print(d)
+        for line in lines:
+            print(line)
         print()
 
 
@@ -649,9 +852,20 @@ Notes:
         '--verbose', '-v', action='store_true',
         help='Show full git status (not short) and scanning details',
     )
+    parser.add_argument(
+        '--dirty', action='store_true',
+        help='Only show repos with non-clean status (errors, behind, or pending changes)',
+    )
+    parser.add_argument(
+        '--no-color', action='store_true',
+        help='Disable colored status output',
+    )
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
 
     args = parser.parse_args()
+
+    if not args.no_color:
+        _init_colors()
 
     # Merge --dir and trailing positional dirs into one list
     all_dirs = args.dir + args.dirs
@@ -663,10 +877,10 @@ Notes:
     if args.summary:
         args.branch = args.status = args.tag = args.release = args.size = True
 
-    reporting = args.branch or args.status or args.tag or args.release or args.size
+    reporting = args.branch or args.status or args.tag or args.release or args.size or args.dirty
     if not reporting and not args.main and not args.clean:
         parser.error("specify at least one of --branch, --status, --tag, --release, "
-                     "--size, --summary, --main, or --clean")
+                     "--size, --summary, --dirty, --main, or --clean")
 
     if args.dry_run and not args.main and not args.clean:
         parser.error("--dry-run only applies to --main or --clean")
@@ -681,25 +895,36 @@ Notes:
         n = len(git_dirs)
         print(f"Found {n} git repositor{'ies' if n != 1 else 'y'}.\n", file=sys.stderr)
 
+    collector = SummaryCollector(len(git_dirs)) if args.summary else None
+    exit_code = 0
     try:
         if reporting:
-            report_repos(git_dirs, args)
+            report_repos(git_dirs, args, collector)
         if args.main:
             cmd_rename_to_main(git_dirs, args)
         if args.clean:
             cmd_clean(git_dirs, args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        exit_code = 130
     except Exception as e:
         print(f"Unexpected error: {e}", file=sys.stderr)
         traceback.print_exc()
-        sys.exit(1)
+        exit_code = 1
+    finally:
+        if collector is not None and collector.repos_processed > 0:
+            print_summary_report(collector)
+
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nInterrupted. Exiting.", file=sys.stderr)
-        sys.exit(0)
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
     except Exception as e:
         print(f"Unexpected error: {e}", file=sys.stderr)
         traceback.print_exc()
