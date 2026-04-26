@@ -30,3 +30,4 @@ venv.bak/
 # PyPI configuration file
 .pypirc
 
+PROFILE_DIR/
