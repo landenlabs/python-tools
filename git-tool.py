@@ -8,7 +8,7 @@ import subprocess
 import sys
 import traceback
 
-VERSION = "v2.0 (Apr-2026)"
+VERSION = "v6.05.03 (May-2026)"
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +401,42 @@ def get_last_release(git_dir):
     return stdout.strip() or None
 
 
+def get_contributors(git_dir):
+    """Return a set of unique commit author names from the full git log."""
+    stdout, _, rc = run_git(git_dir, 'log', '--format=%aN')
+    if rc != 0:
+        return set()
+    return {name.strip() for name in stdout.splitlines() if name.strip()}
+
+
+def get_current_git_user():
+    """Return the configured git user.name, or None."""
+    try:
+        result = subprocess.run(['git', 'config', 'user.name'],
+                                capture_output=True, text=True)
+        return result.stdout.strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def get_remote_owner(git_dir):
+    """Parse the origin remote URL and return the owner/org segment, or None."""
+    stdout, _, rc = run_git(git_dir, 'remote', 'get-url', 'origin')
+    if rc != 0:
+        return None
+    url = stdout.strip()
+    if '://' in url:
+        # https://host/owner/repo[.git]
+        parts = url.split('/')
+        return parts[3] if len(parts) > 3 else None
+    elif ':' in url:
+        # git@host:owner/repo[.git]
+        path = url.split(':', 1)[1]
+        parts = path.split('/')
+        return parts[0] if parts else None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Summary collector
 # ---------------------------------------------------------------------------
@@ -408,8 +444,9 @@ def get_last_release(git_dir):
 class SummaryCollector:
     """Accumulate per-repo statistics for the end-of-run summary report."""
 
-    def __init__(self, repos_found):
+    def __init__(self, repos_found, current_user=None):
         self.repos_found     = repos_found
+        self.current_user    = current_user
         self.repos_processed = 0
         self.total_size_bytes  = 0
         self.largest_path    = None
@@ -424,8 +461,10 @@ class SummaryCollector:
         self.cnt_without_tag = 0
         self.cnt_with_release    = 0
         self.cnt_without_release = 0
+        self.contributors    = set()
+        self.other_owned     = []   # [(repo_basename, owner)] where current user is contributor
 
-    def record(self, path, branch, status, unpushed, tag, release, size_bytes):
+    def record(self, path, branch, status, unpushed, tag, release, size_bytes, contributors=None, repo_owner=None):
         self.repos_processed += 1
 
         if size_bytes is not None:
@@ -467,6 +506,15 @@ class SummaryCollector:
             self.cnt_with_release += 1
         else:
             self.cnt_without_release += 1
+
+        if contributors:
+            self.contributors.update(contributors)
+            if self.current_user and repo_owner:
+                user_lc  = self.current_user.lower()
+                owner_lc = repo_owner.lower()
+                is_contributor = any(c.lower() == user_lc for c in contributors)
+                if is_contributor and owner_lc != user_lc:
+                    self.other_owned.append((os.path.basename(path), repo_owner))
 
 
 def print_summary_report(c):
@@ -517,6 +565,19 @@ def print_summary_report(c):
     print(f"  Releases:")
     print(f"    With release:        {c.cnt_with_release}")
     print(f"    Without release:     {c.cnt_without_release}")
+    print()
+
+    # Contributors
+    if c.contributors:
+        csv = ', '.join(sorted(c.contributors, key=str.lower))
+        print(f"  Contributors:          {csv}")
+    else:
+        print(f"  Contributors:          (none found)")
+
+    # Repos where current user is a contributor but doesn't own the repo
+    if c.other_owned:
+        csv = ', '.join(f"{name} ({owner})" for name, owner in sorted(c.other_owned))
+        print(f"  Contrib. to others:    {csv}")
     print(sep)
 
 
@@ -738,8 +799,12 @@ def report_repos(git_dirs, args, collector=None):
             for line in format_size(d, args.verbose, size_bytes):
                 lines.append(line)
 
+        contributors = repo_owner = None
         if collector is not None:
-            collector.record(d, current, s, unpushed, tag, release, size_bytes)
+            contributors = get_contributors(d)
+            repo_owner   = get_remote_owner(d)
+        if collector is not None:
+            collector.record(d, current, s, unpushed, tag, release, size_bytes, contributors, repo_owner)
 
         if args.dirty and not _is_dirty(s, unpushed):
             continue
@@ -895,7 +960,8 @@ Notes:
         n = len(git_dirs)
         print(f"Found {n} git repositor{'ies' if n != 1 else 'y'}.\n", file=sys.stderr)
 
-    collector = SummaryCollector(len(git_dirs)) if args.summary else None
+    current_user = get_current_git_user() if args.summary else None
+    collector = SummaryCollector(len(git_dirs), current_user) if args.summary else None
     exit_code = 0
     try:
         if reporting:
