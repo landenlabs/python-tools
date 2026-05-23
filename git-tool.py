@@ -9,7 +9,7 @@ import sys
 import traceback
 
 VERSION = "v6.05.03 (May-2026)"
-
+ 
 
 # ---------------------------------------------------------------------------
 # Color support
@@ -760,6 +760,161 @@ def cmd_clean(git_dirs, args):
 
 
 # ---------------------------------------------------------------------------
+# --pull command
+# ---------------------------------------------------------------------------
+
+def cmd_pull(git_dirs, args):
+    """Run git pull on each repo that has a remote."""
+    dry = args.dry_run
+    ran = updated = skipped = errors = 0
+
+    for d in git_dirs:
+        remote_out, _, _ = run_git(d, 'remote')
+        has_remote = bool(remote_out.strip())
+
+        if not has_remote:
+            print(f"  skip  {d}  (no remote)")
+            skipped += 1
+            continue
+
+        if dry:
+            s = get_repo_status(d)
+            print(f"[dry-run] pull  {d}")
+            if s and s['error']:
+                print(f"  status: (error: {s['error']})")
+            elif s and s['behind']:
+                upstream = s['upstream'] or 'upstream'
+                print(f"  would pull {s['behind']} commit(s) from {upstream}")
+            else:
+                print(f"  (already up to date)")
+            print()
+            ran += 1
+            continue
+
+        print(f"pull  {d}")
+        stdout, stderr, rc = run_git(d, 'pull')
+        if rc != 0:
+            print(f"  ERROR: {stderr.strip()}", file=sys.stderr)
+            errors += 1
+        else:
+            out = (stdout + stderr).strip()
+            if out and 'already up to date' not in out.lower():
+                for line in out.splitlines():
+                    print(f"  {line}")
+                updated += 1
+            else:
+                print(f"  (already up to date)")
+        print()
+        ran += 1
+
+    if dry:
+        print(f"Would pull {ran} repo(s); {skipped} skipped (no remote).")
+    else:
+        print(f"Pulled {ran} repo(s) ({updated} updated); {skipped} skipped; {errors} errors.")
+
+
+# ---------------------------------------------------------------------------
+# --push command
+# ---------------------------------------------------------------------------
+
+def cmd_push(git_dirs, args):
+    """Stage all changes, commit with --message, and push each repo."""
+    dry = args.dry_run
+    message = args.message
+    ran = pushed = skipped = errors = 0
+
+    for d in git_dirs:
+        s = get_repo_status(d)
+
+        if s and s['error']:
+            print(f"  skip  {d}  (status error: {s['error']})")
+            skipped += 1
+            continue
+
+        total_staged   = (s['staged_added'] + s['staged_modified'] +
+                          s['staged_deleted'] + s['staged_renamed'])
+        total_unstaged = s['unstaged_modified'] + s['unstaged_deleted']
+        has_changes    = bool(total_staged or total_unstaged or s['untracked'])
+        has_ahead      = s['ahead'] > 0
+
+        if not has_changes and not has_ahead:
+            skipped += 1
+            continue
+
+        remote_out, _, _ = run_git(d, 'remote')
+        has_remote = bool(remote_out.strip())
+
+        if dry:
+            print(f"[dry-run] push  {d}")
+            if has_changes:
+                parts = []
+                if s['staged_added']:    parts.append(f"{s['staged_added']} new")
+                if s['staged_modified']: parts.append(f"{s['staged_modified']} staged-modified")
+                if s['staged_deleted']:  parts.append(f"{s['staged_deleted']} staged-deleted")
+                if s['staged_renamed']:  parts.append(f"{s['staged_renamed']} renamed")
+                if total_unstaged:       parts.append(f"{total_unstaged} unstaged")
+                if s['untracked']:       parts.append(f"{s['untracked']} untracked")
+                print(f"  would add:    {', '.join(parts)}")
+                msg_display = f'"{message}"' if message else "(--message required)"
+                print(f"  would commit: {msg_display}")
+            if has_ahead and not has_changes:
+                print(f"  already {s['ahead']} commit(s) ahead (no new commit)")
+            if has_remote:
+                upstream = s['upstream'] or 'origin'
+                print(f"  would push:   to {upstream}")
+            else:
+                print(f"  no remote:    push will be skipped")
+            print()
+            ran += 1
+            continue
+
+        print(f"push  {d}")
+        ok = True
+
+        if has_changes:
+            _, stderr, rc = run_git(d, 'add', '--all')
+            if rc != 0:
+                print(f"  ERROR (add): {stderr.strip()}", file=sys.stderr)
+                errors += 1
+                ok = False
+
+            if ok:
+                stdout, stderr, rc = run_git(d, 'commit', '-m', message)
+                if rc != 0:
+                    print(f"  ERROR (commit): {stderr.strip()}", file=sys.stderr)
+                    errors += 1
+                    ok = False
+                else:
+                    for line in (stdout + stderr).strip().splitlines():
+                        print(f"  {line}")
+
+        if ok and has_remote:
+            stdout, stderr, rc = run_git(d, 'push')
+            if rc != 0 and ('no upstream' in stderr or 'no tracking' in stderr):
+                branch = get_branch(d)
+                stdout, stderr, rc = run_git(d, 'push', '--set-upstream', 'origin', branch)
+            if rc != 0:
+                print(f"  ERROR (push): {stderr.strip()}", file=sys.stderr)
+                errors += 1
+                ok = False
+            else:
+                for line in (stdout + stderr).strip().splitlines():
+                    print(f"  {line}")
+                pushed += 1
+        elif ok and not has_remote:
+            print(f"  committed; no remote configured — push skipped")
+
+        if ok:
+            ran += 1
+        print()
+
+    if dry:
+        print(f"Would push {ran} repo(s); {skipped} skipped (nothing to do).")
+    else:
+        print(f"Pushed {ran} repo(s) ({pushed} sent to remote); {skipped} skipped; {errors} errors.")
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -855,6 +1010,16 @@ def main():
   git-tool.py --clean ~/projects
   git-tool.py --clean --dry-run ~/projects
 
+  # Pull latest changes for all repos:
+  git-tool.py --pull ~/projects
+  git-tool.py --pull .
+  git-tool.py --pull --dry-run ~/projects
+
+  # Stage, commit, and push all repos:
+  git-tool.py --push --message "global push" ~/projects
+  git-tool.py --push -m "global push" .
+  git-tool.py --push --message "wip" --dry-run ~/projects
+
   # Regex pattern to find repos (searches from cwd):
   git-tool.py --summary "myproject"
   git-tool.py --branch --status ".*2024.*"
@@ -910,8 +1075,20 @@ Notes:
         help='Run fetch --prune, worktree prune, and gc --auto on each repo',
     )
     parser.add_argument(
+        '--pull', action='store_true',
+        help='Pull latest changes for each repository',
+    )
+    parser.add_argument(
+        '--push', action='store_true',
+        help='Stage all changes, commit with --message, and push each repository',
+    )
+    parser.add_argument(
+        '--message', '-m', metavar='MSG',
+        help='Commit message used by --push',
+    )
+    parser.add_argument(
         '--dry-run', action='store_true',
-        help='Preview what --main or --clean would do without making changes',
+        help='Preview what --main, --clean, --pull, or --push would do without making changes',
     )
     parser.add_argument(
         '--verbose', '-v', action='store_true',
@@ -943,12 +1120,15 @@ Notes:
         args.branch = args.status = args.tag = args.release = args.size = True
 
     reporting = args.branch or args.status or args.tag or args.release or args.size or args.dirty
-    if not reporting and not args.main and not args.clean:
+    if not reporting and not args.main and not args.clean and not args.pull and not args.push:
         parser.error("specify at least one of --branch, --status, --tag, --release, "
-                     "--size, --summary, --dirty, --main, or --clean")
+                     "--size, --summary, --dirty, --main, --clean, --pull, or --push")
 
-    if args.dry_run and not args.main and not args.clean:
-        parser.error("--dry-run only applies to --main or --clean")
+    if args.dry_run and not (args.main or args.clean or args.pull or args.push):
+        parser.error("--dry-run only applies to --main, --clean, --pull, or --push")
+
+    if args.push and not args.message and not args.dry_run:
+        parser.error("--push requires --message")
 
     git_dirs = find_git_dirs(all_dirs, verbose=args.verbose)
 
@@ -970,6 +1150,10 @@ Notes:
             cmd_rename_to_main(git_dirs, args)
         if args.clean:
             cmd_clean(git_dirs, args)
+        if args.pull:
+            cmd_pull(git_dirs, args)
+        if args.push:
+            cmd_push(git_dirs, args)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         exit_code = 130

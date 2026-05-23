@@ -244,8 +244,12 @@ def fetch_multipoint(args):
         lat_val, lon_val = parse_location(args.location)
 
         # Longitude, Latitude, MetersMSL
-        FLIGHT_LEVELS = range(10, 110, args.sfl)[:args.nfl]
-        coordinates = [[lon_val, lat_val, flvl * METERS_PER_100FT] for flvl in FLIGHT_LEVELS]
+        coordinates = []
+        if args.nfl == 0:
+            coordinates = [[lon_val, lat_val]]
+        else:
+            FLIGHT_LEVELS = range(10, 110, args.sfl)[:args.nfl]
+            coordinates = [[lon_val, lat_val, flvl * METERS_PER_100FT] for flvl in FLIGHT_LEVELS]
 
         # MultiPoint or LineString
         post_data = {
@@ -714,17 +718,18 @@ def main():
     parser = argparse.ArgumentParser(
         description=f"{VERSION}\nAccess SUN/SSDS products.",
         epilog="""Example usage:
-  python sun-loader.py --series --product=all --all
-  python sun-loader.py --series --product=radar
+  sun-loader.py --series --product=all --all
+  sun-loader.py --series --product=radar
   
-  python sun-loader.py --multipoint
-  python sun-loader.py --multipoint --location=38.83,-104.82 --time=+2H
-  python sun-loader.py --multipoint -p=temperature_FLPacked:packed
+  sun-loader.py --multipoint
+  sun-loader.py --multipoint --location=38.83,-104.82 --time=+2H
+  sun-loader.py --multipoint -p=temperature_FLPacked:packed
+  sun-loader.py --multipoint -p=150:Wmoseastate,150:Significantheightofcombinedwindwavesandswellsurface -v --nfl 0 --loc="-56.532,-66.455"
   
-  python sun-loader.py --elevation
-  python sun-loader.py --elevation --product=8170:Temperature --location=38.83,-104.82 --time=+2H
+  sun-loader.py --elevation
+  sun-loader.py --elevation --product=8170:Temperature --location=38.83,-104.82 --time=+2H
   
-  python sun-loader.py --tile 2,2,2 --product=1900:FIPaltitudeabovems --type=float4:BigIndian 
+  sun-loader.py --tile 2,2,2 --product=1900:FIPaltitudeabovems --type=float4:BigIndian 
   
 Products:
   Multipoint:
@@ -742,6 +747,18 @@ Products:
         1248:Temperaturesurface
         150:Wmoseastate
         150:Significantheightofcombinedwindwavesandswellsurface
+        150:Significant_height_of_wind_waves_surface
+        150:Primary_wave_direction_surface
+        150:Primary_wave_mean_period_surface
+        150:Mean_period_of_wind_waves_surface
+        150:Direction_of_wind_waves_surface
+        150:Wind_direction_from_which_blowing_surface
+        150:Wind_speed_surface
+        150:Significant_height_of_swell_waves_p1
+        150:Direction_of_swell_waves_p1
+        150:Mean_period_of_swell_waves_p1
+        150:Beaufortscale
+
 
 
   Elevation:
