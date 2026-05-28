@@ -56,30 +56,30 @@ def get_ansi_color(color_str):
         'blue': '34', 'magenta': '35', 'cyan': '36', 'white': '37'
     }
     if color_str in names:
-        return f"\033[{names[color_str]}m"
+        return f"\033[1;{names[color_str]}m"
 
     # 2. Hex Long (#xxxxxx)
     if re.match(r'^#[0-9a-f]{6}$', color_str):
         r = int(color_str[1:3], 16)
         g = int(color_str[3:5], 16)
         b = int(color_str[5:7], 16)
-        return f"\033[38;2;{r};{g};{b}m"
+        return f"\033[1;38;2;{r};{g};{b}m"
 
     # 3. Hex Short (#xxx)
     if re.match(r'^#[0-9a-f]{3}$', color_str):
         r = int(color_str[1]*2, 16)
         g = int(color_str[2]*2, 16)
         b = int(color_str[3]*2, 16)
-        return f"\033[38;2;{r};{g};{b}m"
+        return f"\033[1;38;2;{r};{g};{b}m"
 
     # 4. Decimal RGB (xxx,xxx,xxx)
     if re.match(r'^\d{1,3},\d{1,3},\d{1,3}$', color_str):
         r, g, b = map(int, color_str.split(','))
         if all(0 <= c <= 255 for c in (r, g, b)):
-            return f"\033[38;2;{r};{g};{b}m"
+            return f"\033[1;38;2;{r};{g};{b}m"
 
     # Fallback to Yellow if input is invalid
-    return "\033[33m"
+    return "\033[1;33m"
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +140,8 @@ def main():
   # Multiple colors, each with its own patterns:
   tail -f app.log | colorize.py \\
       --color red    --find "ERROR" "FATAL" \\
-      --color yellow --find "WARN" \\
-      --color green  --find "OK" "success" "done"
+      -c yellow -f "WARN" \\
+      -c green  -f "OK" "success" "done"
 
   # Mix hex / RGB / names freely:
   cat access.log | colorize.py \\
@@ -167,14 +167,23 @@ Notes:
   Groups are applied in the order given. If an earlier group has already
   wrapped a span in ANSI escapes, a later group's pattern may not match
   inside that span.
+
+Case sensitivity:
+  By default, regex matching is case-sensitive. Use --ignore-case / -i to
+  match case-insensitively across all patterns. To toggle case for a single
+  pattern instead, use the inline regex flag (?i:...) or (?-i:...):
+      colorize.py -i --color red --find "error" --find "(?-i:FATAL)"
+  matches "error"/"ERROR"/"Error" but only the exact "FATAL".
 """,
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    parser.add_argument("--color", action=ColorAction, metavar="COLOR",
+    parser.add_argument("--color", "-c", action=ColorAction, metavar="COLOR",
                         help="Open a new color group (name, #xxx, #xxxxxx, or r,g,b)")
-    parser.add_argument("--find", action=FindAction, nargs='+', metavar="PATTERN",
+    parser.add_argument("--find", "-f", action=FindAction, nargs='+', metavar="PATTERN",
                         help="One or more regex patterns for the current --color group")
+    parser.add_argument("--ignore-case", "-i", action="store_true",
+                        help="Case-insensitive regex matching for all patterns")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable color output (pass input through unchanged)")
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
@@ -189,10 +198,11 @@ Notes:
         if not g['patterns']:
             parser.error(f"--color {g['color']!r} has no --find patterns")
 
+    flags = re.IGNORECASE if args.ignore_case else 0
     compiled = []
     for g in groups:
         try:
-            rx = re.compile('|'.join(f'(?:{p})' for p in g['patterns']))
+            rx = re.compile('|'.join(f'(?:{p})' for p in g['patterns']), flags)
         except re.error as err:
             parser.error(f"regex error in --color {g['color']!r} group: {err}")
         compiled.append((g['color'], rx))
