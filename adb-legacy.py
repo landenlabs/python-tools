@@ -1,4 +1,8 @@
 #!/usr/bin/python3
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 import os
 from stat import * # ST_SIZE etc
 import sys

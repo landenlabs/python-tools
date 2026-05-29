@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 """Color Tool - Generate color box and gradient PNG images from CSV input"""
 
 import argparse

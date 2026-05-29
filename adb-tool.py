@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 """Android Debug Bridge (ADB) tool """
 
 import subprocess

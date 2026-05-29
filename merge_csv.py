@@ -1,3 +1,7 @@
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 import pandas as pd
 import re
 import os

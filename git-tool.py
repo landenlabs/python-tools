@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 """git-tool - Scan directories and report status about their git projects"""
 
 import argparse

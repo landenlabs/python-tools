@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 """ Dump to terminal formatted floating point values from binary file and optionally generate a heatmap PNG """
 import struct
 import argparse

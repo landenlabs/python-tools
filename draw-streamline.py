@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 """Draw streamline wind path of wind u,v grid from Current Lab"""
 
 import json

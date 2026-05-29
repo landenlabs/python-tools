@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------
+# Copyright (c) 2026 LanDen Labs - Dennis Lang
+# https://landenlabs.com
+# ----------------------------------------------------------------------
 """colorize - Colorize regex matches in piped text using ANSI escape codes."""
 
 import argparse
@@ -187,9 +191,17 @@ Case sensitivity:
     parser.add_argument("--no-color", action="store_true",
                         help="Disable color output (pass input through unchanged)")
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+    parser.add_argument("patterns", nargs='*', metavar="PATTERN",
+                        help="Bare patterns: when no --color/--find given, all positional "
+                             "args are joined by spaces and used as a single yellow regex")
 
     args = parser.parse_args()
     groups = getattr(args, 'groups', None) or []
+
+    if not groups and args.patterns:
+        groups = [{'color': 'yellow', 'patterns': [' '.join(args.patterns)]}]
+    elif groups and args.patterns:
+        parser.error("positional patterns cannot be mixed with --color/--find")
 
     if not groups:
         parser.error("at least one --color COLOR --find PATTERN [...] pair is required")
