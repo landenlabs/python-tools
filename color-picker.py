@@ -13,7 +13,6 @@ import sys
 from PyQt6.QtCore import Qt, QPoint, QRect, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
-    QCursor,
     QFont,
     QGuiApplication,
     QImage,
@@ -280,7 +279,6 @@ class _PickerOverlay(QWidget):
 
     colorPicked = pyqtSignal(QColor)
     cursorPreview = pyqtSignal(QPixmap, int)
-    cursorMoved = pyqtSignal(QPoint)
     cancelled = pyqtSignal()
 
     PREVIEW_SAMPLES = 25  # screen pixels across in the magnified preview (odd)
@@ -328,7 +326,6 @@ class _PickerOverlay(QWidget):
     def mouseMoveEvent(self, event):
         self._cursor_pos = event.position().toPoint()
         self._emit_preview(self._cursor_pos)
-        self.cursorMoved.emit(event.globalPosition().toPoint())
         self.update()
 
     def mousePressEvent(self, event):
@@ -415,7 +412,6 @@ class ScreenPicker(QObject):
 
     colorPicked = pyqtSignal(QColor)
     cursorPreview = pyqtSignal(QPixmap, int)
-    cursorMoved = pyqtSignal(QPoint)
     cancelled = pyqtSignal()
 
     def __init__(self, parent=None, multi: bool = False):
@@ -433,7 +429,6 @@ class ScreenPicker(QObject):
             overlay = _PickerOverlay(screen, pixmap, multi=self._multi)
             overlay.colorPicked.connect(self._on_picked)
             overlay.cursorPreview.connect(self.cursorPreview)
-            overlay.cursorMoved.connect(self.cursorMoved)
             overlay.cancelled.connect(self._on_cancelled)
             overlay.showFullScreen()
             overlay.raise_()
@@ -499,20 +494,11 @@ class MainWindow(QMainWindow):
         self.pick_btn.clicked.connect(self._start_screen_pick)
         self._screen_picker = None
         self._auto_hide_mode = False
-        self._pick_app_rect: QRect | None = None
         self._pick_saved_geom = None  # QByteArray from saveGeometry()
 
-        self.auto_hide_cb = QCheckBox("Auto-hide app while picking")
+        self.auto_hide_cb = QCheckBox("Hide")
         self.auto_hide_cb.setToolTip(
-            "When checked: hide this window during pick, sample a single "
-            "color, then restore the window."
-        )
-
-        self.cursor_hide_cb = QCheckBox("Hide when cursor is over app")
-        self.cursor_hide_cb.setToolTip(
-            "During multi-pick, automatically hide this window whenever "
-            "the cursor moves over its area, and re-show it when the cursor "
-            "leaves. Off by default."
+            "Hide color picker app while picking color from screen"
         )
 
         top = QHBoxLayout()
@@ -527,14 +513,9 @@ class MainWindow(QMainWindow):
         buttons_row.addWidget(self.dup_btn)
         buttons_row.addSpacing(8)
         buttons_row.addWidget(self.pick_btn)
+        buttons_row.addSpacing(8)
+        buttons_row.addWidget(self.auto_hide_cb)
         buttons_row.addStretch(1)
-
-        options_row = QHBoxLayout()
-        options_row.addStretch(1)
-        options_row.addWidget(self.auto_hide_cb)
-        options_row.addSpacing(12)
-        options_row.addWidget(self.cursor_hide_cb)
-        options_row.addStretch(1)
 
         self.r_row = ChannelRow("R")
         self.g_row = ChannelRow("G")
@@ -562,8 +543,6 @@ class MainWindow(QMainWindow):
         v.addLayout(top)
         v.addSpacing(8)
         v.addLayout(buttons_row)
-        v.addSpacing(4)
-        v.addLayout(options_row)
         v.addSpacing(8)
         v.addWidget(self.r_row)
         v.addWidget(self.g_row)
@@ -624,8 +603,6 @@ class MainWindow(QMainWindow):
         # capture size/position so we can restore exactly after hide/show or
         # after flag changes (which can drop geometry on macOS)
         self._pick_saved_geom = self.saveGeometry()
-        if not self._auto_hide_mode:
-            self._pick_app_rect = self.frameGeometry()
         # always hide before the screenshot so our window pixels aren't
         # captured into the overlay's snapshot
         self.hide()
@@ -636,15 +613,12 @@ class MainWindow(QMainWindow):
         self._screen_picker = ScreenPicker(self, multi=multi)
         self._screen_picker.colorPicked.connect(self._on_screen_picked)
         self._screen_picker.cursorPreview.connect(self.box.setPreview)
-        self._screen_picker.cursorMoved.connect(self._on_overlay_cursor_move)
         self._screen_picker.cancelled.connect(self._on_screen_cancelled)
         self._screen_picker.start()
         if multi:
             self.setWindowTitle(PICKING_TITLE)
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-            cursor_hide = self.cursor_hide_cb.isChecked()
-            if not cursor_hide or not self._pick_app_rect.contains(QCursor.pos()):
-                self._show_during_pick()
+            self._show_during_pick()
 
     def _restore_pick_geometry(self):
         if self._pick_saved_geom is not None:
@@ -665,22 +639,6 @@ class MainWindow(QMainWindow):
             self.raise_()
             self.activateWindow()
 
-    def _on_overlay_cursor_move(self, global_pos: QPoint):
-        if self._pick_app_rect is None or not self.cursor_hide_cb.isChecked():
-            return
-        over_app = self._pick_app_rect.contains(global_pos)
-        if over_app and self.isVisible():
-            self.hide()
-        elif not over_app and not self.isVisible():
-            self._show_during_pick()
-
-    def enterEvent(self, event):
-        if (self._pick_app_rect is not None
-            and self.cursor_hide_cb.isChecked()
-            and self.isVisible()):
-            self.hide()
-        super().enterEvent(event)
-
     def _duplicate_window(self):
         child = MainWindow(initial_color=self._color)
         MainWindow._windows.append(child)
@@ -688,16 +646,6 @@ class MainWindow(QMainWindow):
         geo = self.frameGeometry()
         child.move(geo.x() + 40, geo.y() + 40)
         child.show()
-
-    def moveEvent(self, event):
-        if self._pick_app_rect is not None and self.isVisible():
-            self._pick_app_rect = self.frameGeometry()
-        super().moveEvent(event)
-
-    def resizeEvent(self, event):
-        if self._pick_app_rect is not None and self.isVisible():
-            self._pick_app_rect = self.frameGeometry()
-        super().resizeEvent(event)
 
     def _on_screen_picked(self, color: QColor):
         color.setAlpha(self._color.alpha())
@@ -713,7 +661,6 @@ class MainWindow(QMainWindow):
             self._restore_window()
         else:
             self.setWindowTitle(WINDOW_TITLE)
-            self._pick_app_rect = None
             self._set_always_on_top(False)
             self._pick_saved_geom = None
             self._screen_picker = None
