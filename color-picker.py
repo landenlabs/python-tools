@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
+from datetime import datetime
+from pathlib import Path
 
 from PyQt6.QtCore import Qt, QPoint, QRect, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import (
@@ -26,12 +29,15 @@ from PyQt6.QtCore import QRegularExpression
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -40,9 +46,10 @@ from PyQt6.QtWidgets import (
 )
 
 
+__version__ = "1.0.0"
 WHEEL_SIZE = 260
 SWATCH_SIZE = 260
-WINDOW_TITLE = "Color Picker"
+WINDOW_TITLE = f"Color Picker - v{__version__}   LanDen Labs (2026)"
 PICKING_TITLE = "Press escape to end picking"
 
 
@@ -460,6 +467,215 @@ class ScreenPicker(QObject):
         self._overlays.clear()
 
 
+class _MiniSwatch(QFrame):
+    """Tiny solid swatch (over a checkerboard so alpha shows) for list rows."""
+
+    def __init__(self, color: QColor, size: int = 22, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(size, size)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self._color = QColor(color)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        rect = self.contentsRect()
+        tile = 6
+        for y in range(rect.top(), rect.bottom() + 1, tile):
+            for x in range(rect.left(), rect.right() + 1, tile):
+                light = ((x // tile) + (y // tile)) % 2 == 0
+                p.fillRect(
+                    QRect(x, y, tile, tile),
+                    QColor(220, 220, 220) if light else QColor(170, 170, 170),
+                )
+        p.fillRect(rect, self._color)
+
+
+class _RecentColorRow(QWidget):
+    """One row in the recent-colors list: checkbox, #RRGGBBAA hex, swatch.
+
+    Clicking anywhere outside the checkbox activates the color.
+    """
+
+    clicked = pyqtSignal(QColor)
+
+    def __init__(self, color: QColor, parent=None):
+        super().__init__(parent)
+        self.color = QColor(color)
+
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+
+        self.check = QCheckBox()
+
+        hex_text = (
+            f"#{self.color.red():02X}{self.color.green():02X}"
+            f"{self.color.blue():02X}{self.color.alpha():02X}"
+        )
+        label = QLabel(hex_text)
+        label.setFont(QFont("Menlo"))
+
+        h.addWidget(self.check)
+        h.addWidget(label)
+        h.addStretch(1)
+        h.addWidget(_MiniSwatch(self.color))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_selected(self, on: bool):
+        self.setStyleSheet(
+            "background-color: palette(highlight);" if on else ""
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.color)
+        super().mousePressEvent(event)
+
+
+class RecentColors(QWidget):
+    """Scrollable list of recently picked colors, most recent on top.
+
+    Each row has three columns: a checkbox, the #RRGGBBAA hex value, and a
+    small color swatch. Clicking a row activates that color; the "- Del"
+    button removes any checked rows. At most ``MAX`` colors are retained.
+    """
+
+    MAX = 10
+
+    colorActivated = pyqtSignal(QColor)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._selected: _RecentColorRow | None = None
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        self._list = QVBoxLayout(container)
+        self._list.setContentsMargins(4, 4, 4, 4)
+        self._list.setSpacing(4)
+        self._list.addStretch(1)  # keeps rows packed to the top
+        scroll.setWidget(container)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.addWidget(QLabel("Recent"))
+        header_row.addStretch(1)
+        del_btn = QPushButton("- Del")
+        del_btn.setToolTip("Delete the checked colors from the Recent list")
+        del_btn.clicked.connect(self._delete_checked)
+        header_row.addWidget(del_btn)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(header_row)
+        outer.addWidget(scroll)
+
+    def add(self, color: QColor):
+        row = _RecentColorRow(color)
+        row.clicked.connect(lambda c, r=row: self._activate(r, c))
+        self._list.insertWidget(0, row)
+        # trim oldest rows (the stretch always sits last in the layout)
+        while self._list.count() - 1 > self.MAX:
+            item = self._list.takeAt(self._list.count() - 2)
+            w = item.widget()
+            if w is not None:
+                if w is self._selected:
+                    self._selected = None
+                w.deleteLater()
+
+    def _activate(self, row: "_RecentColorRow", color: QColor):
+        if self._selected is not None and self._selected is not row:
+            self._selected.set_selected(False)
+        row.set_selected(True)
+        self._selected = row
+        self.colorActivated.emit(color)
+
+    def _delete_checked(self):
+        for i in reversed(range(self._list.count())):
+            row = self._list.itemAt(i).widget()
+            if isinstance(row, _RecentColorRow) and row.check.isChecked():
+                if row is self._selected:
+                    self._selected = None
+                self._list.takeAt(i)
+                row.deleteLater()
+
+
+def _build_date() -> str:
+    try:
+        return datetime.fromtimestamp(
+            os.path.getmtime(Path(__file__))
+        ).strftime("%Y-%m-%d")
+    except OSError:
+        return "unknown"
+
+
+def _bold_label(text: str) -> QLabel:
+    lbl = QLabel(text)
+    f = lbl.font()
+    f.setBold(True)
+    lbl.setFont(f)
+    return lbl
+
+
+class AboutDialog(QDialog):
+    """About box for the Color Picker (modeled on the adb-log-viewer one)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("About Color Picker")
+        self.setModal(True)
+        self.setFixedWidth(420)
+
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        name_font = QFont()
+        name_font.setPointSize(15)
+        name_font.setBold(True)
+        name_lbl = QLabel("Color Picker")
+        name_lbl.setFont(name_font)
+        root.addWidget(name_lbl)
+
+        desc = QLabel(
+            f"v{__version__}  —  Color picker with a hue/saturation wheel, "
+            "R/G/B/A sliders, hex entry, screen-pixel sampling, and a recent "
+            "colors list."
+        )
+        desc.setWordWrap(True)
+        root.addWidget(desc)
+
+        root.addSpacing(4)
+
+        form = QFormLayout()
+        form.setSpacing(5)
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        form.addRow(_bold_label("Author:"), QLabel("Dennis Lang"))
+        form.addRow(_bold_label("Built:"), QLabel(_build_date()))
+        form.addRow(QLabel(""), QLabel("Created by LanDen Labs (2026)"))
+
+        link = QLabel(
+            '<a href="https://landenlabs.com">https://landenlabs.com</a>'
+        )
+        link.setOpenExternalLinks(True)
+        link.setTextFormat(Qt.TextFormat.RichText)
+        form.addRow(_bold_label("Web:"), link)
+
+        root.addLayout(form)
+        root.addSpacing(6)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+
 class MainWindow(QMainWindow):
     _windows: list = []  # keep duplicated windows alive
 
@@ -475,6 +691,18 @@ class MainWindow(QMainWindow):
         font.setPointSize(font.pointSize() + 4)
         font.setBold(True)
         title.setFont(font)
+
+        self.help_btn = QPushButton("?")
+        self.help_btn.setFixedSize(28, 28)
+        self.help_btn.setToolTip("Show the About dialog (version and credits)")
+        self.help_btn.clicked.connect(self._show_about)
+
+        title_row = QHBoxLayout()
+        title_row.addSpacing(28)  # balance the right-side button so title centers
+        title_row.addStretch(1)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        title_row.addWidget(self.help_btn)
 
         self.wheel = ColorWheel()
         self.box = ColorBox()
@@ -531,25 +759,48 @@ class MainWindow(QMainWindow):
         )
         self.hex_all.setFixedWidth(110)
         self.hex_all.setPlaceholderText("RRGGBBAA")
+        self.add_btn = QPushButton("+ Add")
+        self.add_btn.setToolTip(
+            "Add the current color to the top of the Recent list "
+            "(shortcut: Space)"
+        )
+        self.add_btn.clicked.connect(self._add_current_to_recent)
+
         hex_row = QHBoxLayout()
         hex_row.addStretch(1)
+        hex_row.addWidget(self.add_btn)
+        hex_row.addSpacing(12)
         hex_row.addWidget(hex_label)
         hex_row.addWidget(self.hex_all)
         hex_row.addStretch(1)
 
+        # left half: R/G/B/A sliders + numeric/hex entry
+        channels = QVBoxLayout()
+        channels.addWidget(self.r_row)
+        channels.addWidget(self.g_row)
+        channels.addWidget(self.b_row)
+        channels.addWidget(self.a_row)
+        channels.addSpacing(4)
+        channels.addLayout(hex_row)
+        channels.addStretch(1)
+
+        # right half: scrollable list of recently picked colors
+        self.recent = RecentColors()
+        self.recent.colorActivated.connect(self._on_recent_activated)
+
+        lower = QHBoxLayout()
+        lower.addLayout(channels, 1)
+        lower.addSpacing(12)
+        lower.addWidget(self.recent, 1)
+
         central = QWidget()
         v = QVBoxLayout(central)
-        v.addWidget(title)
+        v.addLayout(title_row)
         v.addLayout(top)
         v.addSpacing(8)
         v.addLayout(buttons_row)
         v.addSpacing(8)
-        v.addWidget(self.r_row)
-        v.addWidget(self.g_row)
-        v.addWidget(self.b_row)
-        v.addWidget(self.a_row)
-        v.addSpacing(4)
-        v.addLayout(hex_row)
+        v.addLayout(lower)
         v.addStretch(1)
         self.setCentralWidget(central)
 
@@ -639,6 +890,15 @@ class MainWindow(QMainWindow):
             self.raise_()
             self.activateWindow()
 
+    def _add_current_to_recent(self):
+        self.recent.add(self._color)
+
+    def _on_recent_activated(self, color: QColor):
+        self._apply_color(color, source="recent")
+
+    def _show_about(self):
+        AboutDialog(self).exec()
+
     def _duplicate_window(self):
         child = MainWindow(initial_color=self._color)
         MainWindow._windows.append(child)
@@ -650,6 +910,7 @@ class MainWindow(QMainWindow):
     def _on_screen_picked(self, color: QColor):
         color.setAlpha(self._color.alpha())
         self._apply_color(color, source="screen")
+        self.recent.add(self._color)
         if self._auto_hide_mode:
             self.box.clearPreview()
             self._restore_window()
@@ -672,6 +933,9 @@ class MainWindow(QMainWindow):
             and self._screen_picker.is_active()
         ):
             self._screen_picker.stop()
+            return
+        if event.key() == Qt.Key.Key_Space:
+            self.recent.add(self._color)
             return
         super().keyPressEvent(event)
 
