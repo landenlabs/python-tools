@@ -519,32 +519,56 @@ class _RecentColorRow(QWidget):
 
     clicked = pyqtSignal(QColor)
 
-    def __init__(self, color: QColor, parent=None):
+    def __init__(self, color: QColor, mode: str = "RGBA", parent=None):
         super().__init__(parent)
         self.color = QColor(color)
+        self._mode = mode
+        # Enable QSS background/border rendering on this custom QWidget so
+        # set_selected() can draw a border around the row.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # Start with a transparent border that reserves space — toggling to
+        # selected just swaps the colour, so the layout doesn't shift.
+        self.setStyleSheet(self._row_style(selected=False))
 
         h = QHBoxLayout(self)
-        h.setContentsMargins(0, 0, 0, 0)
+        # Small margins so the border doesn't crowd the checkbox/label.
+        h.setContentsMargins(2, 1, 2, 1)
         h.setSpacing(8)
 
         self.check = QCheckBox()
 
-        hex_text = (
-            f"#{self.color.red():02X}{self.color.green():02X}"
-            f"{self.color.blue():02X}{self.color.alpha():02X}"
-        )
-        label = QLabel(hex_text)
-        label.setFont(QFont("Menlo"))
+        self._label = QLabel(self._hex_for_mode(mode))
+        self._label.setFont(QFont("Menlo"))
 
         h.addWidget(self.check)
-        h.addWidget(label)
+        h.addWidget(self._label)
         h.addStretch(1)
         h.addWidget(_MiniSwatch(self.color))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
+    def _hex_for_mode(self, mode: str) -> str:
+        c = self.color
+        if mode == "ARGB":
+            return f"#{c.alpha():02X}{c.red():02X}{c.green():02X}{c.blue():02X}"
+        return f"#{c.red():02X}{c.green():02X}{c.blue():02X}{c.alpha():02X}"
+
+    def set_mode(self, mode: str):
+        self._mode = mode
+        self._label.setText(self._hex_for_mode(mode))
+
     def set_selected(self, on: bool):
-        self.setStyleSheet(
-            "background-color: #d0d0d0;" if on else ""
+        self.setStyleSheet(self._row_style(selected=on))
+
+    @staticmethod
+    def _row_style(selected: bool) -> str:
+        # Type selector restricts the style to the row itself — child widgets
+        # (checkbox, hex label, swatch) keep their native rendering, so the
+        # checkbox's check-mark stays plainly visible.
+        colour = "#666" if selected else "transparent"
+        return (
+            "_RecentColorRow { "
+            f"border: 1px solid {colour}; border-radius: 3px; "
+            "}"
         )
 
     def mousePressEvent(self, event):
@@ -570,6 +594,7 @@ class RecentColors(QFrame):
         self.setFrameShape(QFrame.Shape.Box)
         self.setFrameShadow(QFrame.Shadow.Plain)
         self._selected: _RecentColorRow | None = None
+        self._mode = "RGBA"
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         container = QWidget()
@@ -605,7 +630,7 @@ class RecentColors(QFrame):
         outer.addWidget(scroll, 1)
 
     def add(self, color: QColor):
-        row = _RecentColorRow(color)
+        row = _RecentColorRow(color, mode=self._mode)
         row.clicked.connect(lambda c, r=row: self._activate(r, c))
         self._list.insertWidget(0, row)
         # trim oldest rows (the stretch always sits last in the layout)
@@ -650,6 +675,13 @@ class RecentColors(QFrame):
         # count() includes the trailing stretch item.
         self._header.setText(f"Recent ({self._list.count() - 1})")
 
+    def set_mode(self, mode: str):
+        self._mode = mode
+        for i in range(self._list.count()):
+            w = self._list.itemAt(i).widget()
+            if isinstance(w, _RecentColorRow):
+                w.set_mode(mode)
+
     def _save_to_csv(self):
         # Collect colors top-to-bottom (most recent first).
         colors: list[QColor] = []
@@ -672,13 +704,22 @@ class RecentColors(QFrame):
             return
         try:
             with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write("rrggbba,red,green,blue,alpha\n")
-                for c in colors:
-                    f.write(
-                        f"#{c.red():02X}{c.green():02X}"
-                        f"{c.blue():02X}{c.alpha():02X},"
-                        f"{c.red()},{c.green()},{c.blue()},{c.alpha()}\n"
-                    )
+                if self._mode == "ARGB":
+                    f.write("aarrggbb,alpha,red,green,blue\n")
+                    for c in colors:
+                        f.write(
+                            f"#{c.alpha():02X}{c.red():02X}"
+                            f"{c.green():02X}{c.blue():02X},"
+                            f"{c.alpha()},{c.red()},{c.green()},{c.blue()}\n"
+                        )
+                else:
+                    f.write("rrggbba,red,green,blue,alpha\n")
+                    for c in colors:
+                        f.write(
+                            f"#{c.red():02X}{c.green():02X}"
+                            f"{c.blue():02X}{c.alpha():02X},"
+                            f"{c.red()},{c.green()},{c.blue()},{c.alpha()}\n"
+                        )
         except OSError as exc:
             QMessageBox.warning(
                 self, "Save Recent Colors", f"Could not write file:\n{exc}"
@@ -894,6 +935,15 @@ class MainWindow(QMainWindow):
             "Hide color picker app while picking color from screen"
         )
 
+        self.mode_btn = QPushButton("RGBA")
+        self.mode_btn.setToolTip(
+            "Toggle color component order between RGBA and ARGB.\n"
+            "Affects the slider order, the hex field format, the Recent\n"
+            "list hex labels, and the CSV export."
+        )
+        self.mode_btn.clicked.connect(self._toggle_color_mode)
+        self.mode_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
         # Stretch ratios 1:2:1 centre the wheel in the left half of the
         # window and the box in the right half as the window widens.
         top = QHBoxLayout()
@@ -905,6 +955,8 @@ class MainWindow(QMainWindow):
 
         buttons_row = QHBoxLayout()
         buttons_row.addStretch(1)
+        buttons_row.addWidget(self.mode_btn)
+        buttons_row.addSpacing(8)
         buttons_row.addWidget(self.dup_btn)
         buttons_row.addSpacing(8)
         buttons_row.addWidget(self.pick_btn)
@@ -949,19 +1001,22 @@ class MainWindow(QMainWindow):
         hex_row.addStretch(1)
 
         # left half: R/G/B/A sliders + numeric/hex entry, wrapped in a
-        # bordered frame so it reads as a single group.
+        # bordered frame so it reads as a single group. The channel rows
+        # are reordered in-place when the RGBA/ARGB toggle is pressed —
+        # we keep a reference to the layout for that.
         channels_frame = QFrame()
         channels_frame.setFrameShape(QFrame.Shape.Box)
         channels_frame.setFrameShadow(QFrame.Shadow.Plain)
-        channels = QVBoxLayout(channels_frame)
-        channels.setContentsMargins(8, 8, 8, 8)
-        channels.addWidget(self.r_row)
-        channels.addWidget(self.g_row)
-        channels.addWidget(self.b_row)
-        channels.addWidget(self.a_row)
-        channels.addSpacing(4)
-        channels.addLayout(hex_row)
-        channels.addStretch(1)
+        self._channels_layout = QVBoxLayout(channels_frame)
+        self._channels_layout.setContentsMargins(8, 8, 8, 8)
+        self._channels_layout.addWidget(self.r_row)
+        self._channels_layout.addWidget(self.g_row)
+        self._channels_layout.addWidget(self.b_row)
+        self._channels_layout.addWidget(self.a_row)
+        self._channels_layout.addSpacing(4)
+        self._channels_layout.addLayout(hex_row)
+        self._channels_layout.addStretch(1)
+        self._color_mode = "RGBA"
 
         # right half: scrollable list of recently picked colors (RecentColors
         # is itself a QFrame with a thin border).
@@ -1012,12 +1067,15 @@ class MainWindow(QMainWindow):
         if source != "wheel":
             self.wheel.setColor(self._color)
         if source != "hex_all":
-            self.hex_all.setText(
-                f"{self._color.red():02X}{self._color.green():02X}"
-                f"{self._color.blue():02X}{self._color.alpha():02X}"
-            )
+            self.hex_all.setText(self._format_hex(self._color))
         self.box.setColor(self._color)
         self._guard = False
+
+    def _format_hex(self, color: QColor) -> str:
+        r, g, b, a = color.red(), color.green(), color.blue(), color.alpha()
+        if self._color_mode == "ARGB":
+            return f"{a:02X}{r:02X}{g:02X}{b:02X}"
+        return f"{r:02X}{g:02X}{b:02X}{a:02X}"
 
     def _from_channels(self, _):
         if self._guard:
@@ -1083,6 +1141,29 @@ class MainWindow(QMainWindow):
 
     def _add_current_to_recent(self):
         self.recent.add(self._color)
+
+    def _toggle_color_mode(self):
+        new_mode = "ARGB" if self._color_mode == "RGBA" else "RGBA"
+        self._color_mode = new_mode
+        # Reorder the four channel widgets without touching the trailing
+        # spacing / hex_row / stretch items that follow them.
+        rows = [self.r_row, self.g_row, self.b_row, self.a_row]
+        for row in rows:
+            self._channels_layout.removeWidget(row)
+        if new_mode == "ARGB":
+            ordered = [self.a_row, self.r_row, self.g_row, self.b_row]
+        else:
+            ordered = [self.r_row, self.g_row, self.b_row, self.a_row]
+        for i, row in enumerate(ordered):
+            self._channels_layout.insertWidget(i, row)
+        self.hex_all.setPlaceholderText(
+            "AARRGGBB" if new_mode == "ARGB" else "RRGGBBAA"
+        )
+        # Re-render the hex_all field in the new format.
+        self.hex_all.setText(self._format_hex(self._color))
+        # Update recent rows and remember the mode for new adds & CSV export.
+        self.recent.set_mode(new_mode)
+        self.mode_btn.setText(new_mode)
 
     def dragEnterEvent(self, event):
         md = event.mimeData()
@@ -1199,12 +1280,16 @@ class MainWindow(QMainWindow):
             return
         text = text.ljust(8, "F") if len(text) < 8 else text[:8]
         try:
-            r = int(text[0:2], 16)
-            g = int(text[2:4], 16)
-            b = int(text[4:6], 16)
-            a = int(text[6:8], 16)
+            b0 = int(text[0:2], 16)
+            b1 = int(text[2:4], 16)
+            b2 = int(text[4:6], 16)
+            b3 = int(text[6:8], 16)
         except ValueError:
             return
+        if self._color_mode == "ARGB":
+            a, r, g, b = b0, b1, b2, b3
+        else:
+            r, g, b, a = b0, b1, b2, b3
         self._apply_color(QColor(r, g, b, a), source="hex_all")
 
 
