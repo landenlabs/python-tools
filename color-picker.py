@@ -31,15 +31,18 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtCore import QRegularExpression
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -159,9 +162,18 @@ class ColorBox(QFrame):
         self._color = QColor(255, 0, 0, 255)
         self._preview: QPixmap | None = None
         self._preview_samples = 0
+        self._image: QPixmap | None = None
 
     def setColor(self, color: QColor):
         self._color = QColor(color)
+        # Any explicit color change exits image-display mode.
+        self._image = None
+        self.update()
+
+    def setImage(self, pixmap: QPixmap):
+        """Display ``pixmap`` stretched to fill the swatch (drop/paste cue)."""
+        self._image = pixmap
+        self._preview = None
         self.update()
 
     def setPreview(self, pixmap: QPixmap, samples: int):
@@ -195,6 +207,9 @@ class ColorBox(QFrame):
             p.setPen(QPen(Qt.GlobalColor.white, 1))
             p.drawRect(box)
             return
+        if self._image is not None:
+            p.drawPixmap(rect, self._image)
+            return
         # checkerboard so alpha is visible
         tile = 12
         for y in range(rect.top(), rect.bottom() + 1, tile):
@@ -226,6 +241,7 @@ class ChannelRow(QWidget):
         self.spin = QSpinBox()
         self.spin.setRange(0, 255)
         self.spin.setFixedWidth(70)
+        self.spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
 
         self.hex = QLineEdit()
         self.hex.setFixedWidth(50)
@@ -537,7 +553,7 @@ class _RecentColorRow(QWidget):
         super().mousePressEvent(event)
 
 
-class RecentColors(QWidget):
+class RecentColors(QFrame):
     """Scrollable list of recently picked colors, most recent on top.
 
     Each row has three columns: a checkbox, the #RRGGBBAA hex value, and a
@@ -545,12 +561,14 @@ class RecentColors(QWidget):
     button removes any checked rows. At most ``MAX`` colors are retained.
     """
 
-    MAX = 10
+    MAX = 256
 
     colorActivated = pyqtSignal(QColor)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.Box)
+        self.setFrameShadow(QFrame.Shadow.Plain)
         self._selected: _RecentColorRow | None = None
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -563,17 +581,28 @@ class RecentColors(QWidget):
 
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
-        header_row.addWidget(QLabel("Recent"))
+        self._header = QLabel()
+        header_row.addWidget(self._header)
         header_row.addStretch(1)
+        self._update_header()
+        save_btn = QPushButton("Save")
+        save_btn.setToolTip(
+            "Save all colors in the Recent list to a CSV file "
+            "(#RRGGBBAA,R,G,B,A per row)"
+        )
+        save_btn.clicked.connect(self._save_to_csv)
+        header_row.addWidget(save_btn)
         del_btn = QPushButton("- Del")
         del_btn.setToolTip("Delete the checked colors from the Recent list")
         del_btn.clicked.connect(self._delete_checked)
         header_row.addWidget(del_btn)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(6, 6, 6, 6)
         outer.addLayout(header_row)
-        outer.addWidget(scroll)
+        # stretch=1 lets the scroll area absorb vertical growth when the
+        # main window is resized taller.
+        outer.addWidget(scroll, 1)
 
     def add(self, color: QColor):
         row = _RecentColorRow(color)
@@ -587,6 +616,7 @@ class RecentColors(QWidget):
                 if w is self._selected:
                     self._selected = None
                 w.deleteLater()
+        self._update_header()
 
     def _activate(self, row: "_RecentColorRow", color: QColor):
         if self._selected is not None and self._selected is not row:
@@ -603,6 +633,56 @@ class RecentColors(QWidget):
                     self._selected = None
                 self._list.takeAt(i)
                 row.deleteLater()
+        self._update_header()
+
+    def clear_all(self):
+        """Remove every color row (preserves the trailing stretch item)."""
+        self._selected = None
+        # Rows sit at indices 0..N-1 and the stretch is the last item.
+        while self._list.count() > 1:
+            item = self._list.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._update_header()
+
+    def _update_header(self):
+        # count() includes the trailing stretch item.
+        self._header.setText(f"Recent ({self._list.count() - 1})")
+
+    def _save_to_csv(self):
+        # Collect colors top-to-bottom (most recent first).
+        colors: list[QColor] = []
+        for i in range(self._list.count()):
+            w = self._list.itemAt(i).widget()
+            if isinstance(w, _RecentColorRow):
+                colors.append(w.color)
+        if not colors:
+            QMessageBox.information(
+                self, "Save Recent Colors", "The Recent list is empty."
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Recent Colors",
+            "recent_colors.csv",
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("rrggbba,red,green,blue,alpha\n")
+                for c in colors:
+                    f.write(
+                        f"#{c.red():02X}{c.green():02X}"
+                        f"{c.blue():02X}{c.alpha():02X},"
+                        f"{c.red()},{c.green()},{c.blue()},{c.alpha()}\n"
+                    )
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Save Recent Colors", f"Could not write file:\n{exc}"
+            )
 
 
 def _build_date() -> str:
@@ -739,6 +819,26 @@ class AboutDialog(QDialog):
         self._last_frame_num = frame_num
 
 
+def _extract_palette(image: QImage, max_colors: int = 256) -> list[QColor]:
+    """Return up to ``max_colors`` representative colors from ``image``.
+
+    Uses Qt's built-in quantization via Format_Indexed8, which produces a
+    palette of at most 256 entries — exactly the cap requested for this
+    feature.
+    """
+    indexed = image.convertToFormat(QImage.Format.Format_Indexed8)
+    seen: set[int] = set()
+    colors: list[QColor] = []
+    for rgba in indexed.colorTable():
+        if rgba in seen:
+            continue
+        seen.add(rgba)
+        colors.append(QColor.fromRgba(rgba))
+        if len(colors) >= max_colors:
+            break
+    return colors
+
+
 class MainWindow(QMainWindow):
     _windows: list = []  # keep duplicated windows alive
 
@@ -794,10 +894,12 @@ class MainWindow(QMainWindow):
             "Hide color picker app while picking color from screen"
         )
 
+        # Stretch ratios 1:2:1 centre the wheel in the left half of the
+        # window and the box in the right half as the window widens.
         top = QHBoxLayout()
         top.addStretch(1)
         top.addWidget(self.wheel, 0, Qt.AlignmentFlag.AlignVCenter)
-        top.addSpacing(16)
+        top.addStretch(2)
         top.addWidget(self.box, 0, Qt.AlignmentFlag.AlignVCenter)
         top.addStretch(1)
 
@@ -846,8 +948,13 @@ class MainWindow(QMainWindow):
         hex_row.addWidget(self.hex_all)
         hex_row.addStretch(1)
 
-        # left half: R/G/B/A sliders + numeric/hex entry
-        channels = QVBoxLayout()
+        # left half: R/G/B/A sliders + numeric/hex entry, wrapped in a
+        # bordered frame so it reads as a single group.
+        channels_frame = QFrame()
+        channels_frame.setFrameShape(QFrame.Shape.Box)
+        channels_frame.setFrameShadow(QFrame.Shadow.Plain)
+        channels = QVBoxLayout(channels_frame)
+        channels.setContentsMargins(8, 8, 8, 8)
         channels.addWidget(self.r_row)
         channels.addWidget(self.g_row)
         channels.addWidget(self.b_row)
@@ -856,12 +963,13 @@ class MainWindow(QMainWindow):
         channels.addLayout(hex_row)
         channels.addStretch(1)
 
-        # right half: scrollable list of recently picked colors
+        # right half: scrollable list of recently picked colors (RecentColors
+        # is itself a QFrame with a thin border).
         self.recent = RecentColors()
         self.recent.colorActivated.connect(self._on_recent_activated)
 
         lower = QHBoxLayout()
-        lower.addLayout(channels, 1)
+        lower.addWidget(channels_frame, 1)
         lower.addSpacing(12)
         lower.addWidget(self.recent, 1)
 
@@ -872,8 +980,9 @@ class MainWindow(QMainWindow):
         v.addSpacing(8)
         v.addLayout(buttons_row)
         v.addSpacing(8)
-        v.addLayout(lower)
-        v.addStretch(1)
+        # Stretch=1 hands extra vertical height to the lower row so the
+        # Recent list grows when the user resizes the window taller.
+        v.addLayout(lower, 1)
         self.setCentralWidget(central)
 
         self.r_row.valueChanged.connect(self._from_channels)
@@ -882,6 +991,13 @@ class MainWindow(QMainWindow):
         self.a_row.valueChanged.connect(self._from_channels)
         self.wheel.colorPicked.connect(self._from_wheel)
         self.hex_all.editingFinished.connect(self._from_hex_all)
+
+        # Accept dropped images and provide a Ctrl+V paste shortcut. Text
+        # fields keep their own widget-scope Ctrl+V (more specific context
+        # wins), so pasting into the hex field still inserts text.
+        self.setAcceptDrops(True)
+        paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self)
+        paste_shortcut.activated.connect(self._paste_image)
 
         self._apply_color(self._color, source="init")
 
@@ -967,6 +1083,55 @@ class MainWindow(QMainWindow):
 
     def _add_current_to_recent(self):
         self.recent.add(self._color)
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md.hasImage() or md.hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        image = self._image_from_mime(event.mimeData())
+        if image is not None and not image.isNull():
+            self._process_image(image)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _paste_image(self):
+        cb = QApplication.clipboard()
+        # Image data first, then fall back to a file URL on the clipboard.
+        img = cb.image()
+        if img.isNull():
+            img = self._image_from_mime(cb.mimeData())
+        if img is not None and not img.isNull():
+            self._process_image(img)
+
+    @staticmethod
+    def _image_from_mime(md) -> QImage | None:
+        if md.hasImage():
+            data = md.imageData()
+            if isinstance(data, QImage):
+                return data
+            if isinstance(data, QPixmap):
+                return data.toImage()
+        if md.hasUrls():
+            for url in md.urls():
+                if url.isLocalFile():
+                    img = QImage(url.toLocalFile())
+                    if not img.isNull():
+                        return img
+        return None
+
+    def _process_image(self, image: QImage):
+        # Show the image stretched into the swatch as a visual confirmation.
+        self.box.setImage(QPixmap.fromImage(image))
+        # Replace Recent with up to 256 unique colors quantized from the image.
+        self.recent.clear_all()
+        for color in _extract_palette(image, max_colors=256):
+            self.recent.add(color)
 
     def _on_recent_activated(self, color: QColor):
         self._apply_color(color, source="recent")
