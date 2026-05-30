@@ -13,17 +13,21 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QPoint, QRect, QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QRect, QObject, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QFont,
     QGuiApplication,
     QImage,
+    QImageReader,
     QIntValidator,
+    QKeySequence,
+    QMovie,
     QPainter,
     QPen,
     QPixmap,
     QRegularExpressionValidator,
+    QShortcut,
 )
 from PyQt6.QtCore import QRegularExpression
 from PyQt6.QtWidgets import (
@@ -524,7 +528,7 @@ class _RecentColorRow(QWidget):
 
     def set_selected(self, on: bool):
         self.setStyleSheet(
-            "background-color: palette(highlight);" if on else ""
+            "background-color: #d0d0d0;" if on else ""
         )
 
     def mousePressEvent(self, event):
@@ -618,6 +622,23 @@ def _bold_label(text: str) -> QLabel:
     return lbl
 
 
+_DIALOG_WIDTH = 420
+_ANIM_MAX_W = _DIALOG_WIDTH - 32
+
+
+def _animation_path() -> Path:
+    return Path(__file__).parent / "screens" / "landenlabs_400.webp"
+
+
+def _animation_display_size(path: Path) -> QSize:
+    """Return display size that preserves the animation's native aspect ratio."""
+    native = QImageReader(str(path)).size()
+    if not native.isValid() or native.width() == 0:
+        return QSize(_ANIM_MAX_W, _ANIM_MAX_W)
+    scale = min(1.0, _ANIM_MAX_W / native.width())
+    return QSize(int(native.width() * scale), int(native.height() * scale))
+
+
 class AboutDialog(QDialog):
     """About box for the Color Picker (modeled on the adb-log-viewer one)."""
 
@@ -625,11 +646,30 @@ class AboutDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("About Color Picker")
         self.setModal(True)
-        self.setFixedWidth(420)
+        self.setFixedWidth(_DIALOG_WIDTH)
+
+        self._movie: QMovie | None = None
+        self._final_pixmap: QPixmap | None = None
+        self._last_frame_num: int = -1
 
         root = QVBoxLayout(self)
         root.setSpacing(10)
         root.setContentsMargins(16, 16, 16, 16)
+
+        # Animated logo (plays once, then freezes on the last frame).
+        self._anim_label = QLabel()
+        self._anim_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        anim_path = _animation_path()
+        if anim_path.exists():
+            display_size = _animation_display_size(anim_path)
+            self._anim_label.setFixedSize(display_size)
+            self._movie = QMovie(str(anim_path))
+            self._movie.setScaledSize(display_size)
+            self._anim_label.setMovie(self._movie)
+            self._movie.frameChanged.connect(self._on_frame_changed)
+            root.addWidget(
+                self._anim_label, alignment=Qt.AlignmentFlag.AlignCenter
+            )
 
         name_font = QFont()
         name_font.setPointSize(15)
@@ -639,9 +679,9 @@ class AboutDialog(QDialog):
         root.addWidget(name_lbl)
 
         desc = QLabel(
-            f"v{__version__}  —  Color picker with a hue/saturation wheel, "
-            "R/G/B/A sliders, hex entry, screen-pixel sampling, and a recent "
-            "colors list."
+            f"v{__version__}  —  Color picker with a color wheel, "
+            "R/G/B/A sliders, hex entry, screen-pixel sampling, and a "
+            "recent colors list."
         )
         desc.setWordWrap(True)
         root.addWidget(desc)
@@ -674,6 +714,29 @@ class AboutDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn)
         root.addLayout(btn_row)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._movie is not None:
+            self._last_frame_num = -1
+            self._final_pixmap = None
+            self._movie.start()
+
+    def _on_frame_changed(self, frame_num: int):
+        # QMovie doesn't expose a reliable "play once" flag for animated WebP,
+        # and frameCount() returns 0 for some encoders. Detect the wrap from
+        # the last frame back to frame 0 and freeze on the previously cached
+        # final frame.
+        if self._movie is None:
+            return
+        if frame_num == 0 and self._last_frame_num > 0:
+            self._movie.stop()
+            if self._final_pixmap is not None:
+                self._anim_label.setMovie(None)
+                self._anim_label.setPixmap(self._final_pixmap)
+            return
+        self._final_pixmap = self._movie.currentPixmap()
+        self._last_frame_num = frame_num
 
 
 class MainWindow(QMainWindow):
@@ -712,6 +775,7 @@ class MainWindow(QMainWindow):
             "Open another color-picker window initialized to the current color."
         )
         self.dup_btn.clicked.connect(self._duplicate_window)
+        self.dup_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.pick_btn = QPushButton("Pick from Screen")
         self.pick_btn.setToolTip(
@@ -720,6 +784,7 @@ class MainWindow(QMainWindow):
             "macOS: requires Screen Recording permission to sample other apps."
         )
         self.pick_btn.clicked.connect(self._start_screen_pick)
+        self.pick_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._screen_picker = None
         self._auto_hide_mode = False
         self._pick_saved_geom = None  # QByteArray from saveGeometry()
@@ -762,9 +827,16 @@ class MainWindow(QMainWindow):
         self.add_btn = QPushButton("+ Add")
         self.add_btn.setToolTip(
             "Add the current color to the top of the Recent list "
-            "(shortcut: Space)"
+            "(shortcut: Ctrl+Space)"
         )
         self.add_btn.clicked.connect(self._add_current_to_recent)
+        self.add_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        # Ctrl+Space adds the current color to Recent regardless of which
+        # widget has keyboard focus (plain Space gets eaten by whichever
+        # button was last clicked, e.g. the "- Del" button).
+        add_shortcut = QShortcut(QKeySequence("Ctrl+Space"), self)
+        add_shortcut.activated.connect(self._add_current_to_recent)
 
         hex_row = QHBoxLayout()
         hex_row.addStretch(1)
@@ -855,7 +927,10 @@ class MainWindow(QMainWindow):
         # after flag changes (which can drop geometry on macOS)
         self._pick_saved_geom = self.saveGeometry()
         # always hide before the screenshot so our window pixels aren't
-        # captured into the overlay's snapshot
+        # captured into the overlay's snapshot, AND so the subsequent
+        # WindowStaysOnTopHint flag toggle (which recreates the native HWND
+        # on Windows) happens invisibly. Without the hide, the picker stays
+        # stuck under the overlay on Windows.
         self.hide()
         QTimer.singleShot(200, self._launch_screen_picker)
 
@@ -914,7 +989,13 @@ class MainWindow(QMainWindow):
         if self._auto_hide_mode:
             self.box.clearPreview()
             self._restore_window()
-        # multi mode: leave overlays up, await further picks or Esc
+            return
+        # multi mode: leave overlays up, await further picks or Esc.
+        # Clicking the overlay activated it on Windows, which (since both
+        # windows are topmost) pushed the overlay above the picker. Re-raise
+        # the picker so its updates remain visible.
+        self.raise_()
+        self.activateWindow()
 
     def _on_screen_cancelled(self):
         self.box.clearPreview()
@@ -933,9 +1014,6 @@ class MainWindow(QMainWindow):
             and self._screen_picker.is_active()
         ):
             self._screen_picker.stop()
-            return
-        if event.key() == Qt.Key.Key_Space:
-            self.recent.add(self._color)
             return
         super().keyPressEvent(event)
 
