@@ -13,7 +13,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QPoint, QRect, QObject, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    Qt, QObject, QPoint, QRect, QSettings, QSize, QTimer, pyqtSignal,
+)
 from PyQt6.QtGui import (
     QColor,
     QFont,
@@ -24,6 +26,7 @@ from PyQt6.QtGui import (
     QKeySequence,
     QMovie,
     QPainter,
+    QPalette,
     QPen,
     QPixmap,
     QRegularExpressionValidator,
@@ -58,6 +61,44 @@ WHEEL_SIZE = 260
 SWATCH_SIZE = 260
 WINDOW_TITLE = f"Color Picker - v{__version__}   LanDen Labs (2026)"
 PICKING_TITLE = "Press escape to end picking"
+
+SETTINGS_ORG = "LanDenLabs"
+SETTINGS_APP = "ColorPicker"
+DEFAULT_THEME = "Light"
+
+
+def _apply_theme(theme: str) -> None:
+    """Apply ``theme`` ("Light" or "Dark") to the running QApplication."""
+    app = QApplication.instance()
+    if app is None:
+        return
+    app.setStyle("Fusion")
+    if theme == "Dark":
+        p = QPalette()
+        p.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
+        p.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.Base, QColor(35, 35, 35))
+        p.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
+        p.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
+        p.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
+        p.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+        p.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+        p.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        p.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.Text, QColor(127, 127, 127),
+        )
+        p.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.ButtonText, QColor(127, 127, 127),
+        )
+        app.setPalette(p)
+    else:
+        app.setPalette(app.style().standardPalette())
 
 
 class ColorWheel(QWidget):
@@ -523,15 +564,14 @@ class _RecentColorRow(QWidget):
         super().__init__(parent)
         self.color = QColor(color)
         self._mode = mode
-        # Enable QSS background/border rendering on this custom QWidget so
-        # set_selected() can draw a border around the row.
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        # Start with a transparent border that reserves space — toggling to
-        # selected just swaps the colour, so the layout doesn't shift.
-        self.setStyleSheet(self._row_style(selected=False))
+        # Painted directly in paintEvent so we don't apply a row-level QSS
+        # rule — using WA_StyledBackground+setStyleSheet here was caching
+        # the palette text colour and making the hex labels lag one theme
+        # toggle behind.
+        self._selected = False
 
         h = QHBoxLayout(self)
-        # Small margins so the border doesn't crowd the checkbox/label.
+        # Leave a small inset so the painted border doesn't crowd children.
         h.setContentsMargins(2, 1, 2, 1)
         h.setSpacing(8)
 
@@ -557,19 +597,22 @@ class _RecentColorRow(QWidget):
         self._label.setText(self._hex_for_mode(mode))
 
     def set_selected(self, on: bool):
-        self.setStyleSheet(self._row_style(selected=on))
+        if self._selected == on:
+            return
+        self._selected = on
+        self.update()
 
-    @staticmethod
-    def _row_style(selected: bool) -> str:
-        # Type selector restricts the style to the row itself — child widgets
-        # (checkbox, hex label, swatch) keep their native rendering, so the
-        # checkbox's check-mark stays plainly visible.
-        colour = "#666" if selected else "transparent"
-        return (
-            "_RecentColorRow { "
-            f"border: 1px solid {colour}; border-radius: 3px; "
-            "}"
-        )
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._selected:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Medium grey reads OK against both Light and Dark palettes.
+        p.setPen(QPen(QColor("#888"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        r = self.rect().adjusted(0, 0, -1, -1)
+        p.drawRoundedRect(r, 3, 3)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -606,6 +649,12 @@ class RecentColors(QFrame):
 
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
+        self._master_check = QCheckBox()
+        self._master_check.setToolTip(
+            "Check or uncheck every row in the Recent list"
+        )
+        self._master_check.toggled.connect(self._set_all_checked)
+        header_row.addWidget(self._master_check)
         self._header = QLabel()
         header_row.addWidget(self._header)
         header_row.addStretch(1)
@@ -682,6 +731,12 @@ class RecentColors(QFrame):
             if isinstance(w, _RecentColorRow):
                 w.set_mode(mode)
 
+    def _set_all_checked(self, on: bool):
+        for i in range(self._list.count()):
+            w = self._list.itemAt(i).widget()
+            if isinstance(w, _RecentColorRow):
+                w.check.setChecked(on)
+
     def _save_to_csv(self):
         # Collect colors top-to-bottom (most recent first).
         colors: list[QColor] = []
@@ -713,7 +768,7 @@ class RecentColors(QFrame):
                             f"{c.alpha()},{c.red()},{c.green()},{c.blue()}\n"
                         )
                 else:
-                    f.write("rrggbba,red,green,blue,alpha\n")
+                    f.write("rrggbbaa,red,green,blue,alpha\n")
                     for c in colors:
                         f.write(
                             f"#{c.red():02X}{c.green():02X}"
@@ -944,6 +999,17 @@ class MainWindow(QMainWindow):
         self.mode_btn.clicked.connect(self._toggle_color_mode)
         self.mode_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
+        # Theme defaults to Light; persisted across sessions via QSettings.
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self._theme = settings.value("theme", DEFAULT_THEME, type=str)
+        if self._theme not in ("Light", "Dark"):
+            self._theme = DEFAULT_THEME
+        _apply_theme(self._theme)
+        self.theme_btn = QPushButton(self._theme)
+        self.theme_btn.setToolTip("Toggle between Light and Dark theme")
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        self.theme_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
         # Stretch ratios 1:2:1 centre the wheel in the left half of the
         # window and the box in the right half as the window widens.
         top = QHBoxLayout()
@@ -955,6 +1021,8 @@ class MainWindow(QMainWindow):
 
         buttons_row = QHBoxLayout()
         buttons_row.addStretch(1)
+        buttons_row.addWidget(self.theme_btn)
+        buttons_row.addSpacing(8)
         buttons_row.addWidget(self.mode_btn)
         buttons_row.addSpacing(8)
         buttons_row.addWidget(self.dup_btn)
@@ -1142,6 +1210,12 @@ class MainWindow(QMainWindow):
     def _add_current_to_recent(self):
         self.recent.add(self._color)
 
+    def _toggle_theme(self):
+        self._theme = "Dark" if self._theme == "Light" else "Light"
+        _apply_theme(self._theme)
+        self.theme_btn.setText(self._theme)
+        QSettings(SETTINGS_ORG, SETTINGS_APP).setValue("theme", self._theme)
+
     def _toggle_color_mode(self):
         new_mode = "ARGB" if self._color_mode == "RGBA" else "RGBA"
         self._color_mode = new_mode
@@ -1295,6 +1369,16 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    QApplication.setOrganizationName(SETTINGS_ORG)
+    QApplication.setApplicationName(SETTINGS_APP)
+    # Apply persisted theme before any windows are created so there's no
+    # flash of the default style.
+    theme = QSettings(SETTINGS_ORG, SETTINGS_APP).value(
+        "theme", DEFAULT_THEME, type=str
+    )
+    if theme not in ("Light", "Dark"):
+        theme = DEFAULT_THEME
+    _apply_theme(theme)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
