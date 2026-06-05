@@ -506,6 +506,114 @@ def cmd_alpha(args):
 
 
 # ---------------------------------------------------------------------------
+# --make-avg command  (Android Vector Drawable gradient)
+# ---------------------------------------------------------------------------
+
+# Fixed AVG scaffolding from the sample; only the <item> stops are generated.
+AVG_HEAD = '''<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="288dp"
+    android:height="8dp"
+    android:viewportWidth="288"
+    android:viewportHeight="8">
+  <path
+      android:pathData="M0,0h288v8h-288z">
+    <aapt:attr name="android:fillColor">
+      <gradient
+          android:startX="0"
+          android:startY="4"
+          android:endX="288"
+          android:endY="4"
+          android:type="linear">
+'''
+
+AVG_TAIL = '''      </gradient>
+    </aapt:attr>
+  </path>
+</vector>
+'''
+
+
+def fmt_avg_offset(i, n):
+    """Map step index i of n steps to a gradient offset string in [0.00, 1.00]."""
+    off = 0.0 if n <= 1 else i / (n - 1)
+    # Trim trailing zeros but always keep at least 2 decimal places.
+    intpart, _, dec = f"{off:.5f}".rstrip('0').partition('.')
+    return f"{intpart}.{(dec + '00')[:2] if len(dec) < 2 else dec}"
+
+
+def fmt_avg_color(r, g, b, a):
+    """Encode RGBA (0-255) as an Android #aarrggbb hex color."""
+    return f"#{a:02X}{r:02X}{g:02X}{b:02X}"
+
+
+def load_step_colors(input_file, verbose=False):
+    """
+    Parse the indented 'Step:/A:/R:/G:/B:' block format (see vil-colors.txt).
+    Returns a list of (r, g, b, a) tuples (0-255) ordered by step index.
+    """
+    blocks = []
+    cur = None
+
+    def flush(block):
+        if block is not None and 'Step' in block:
+            blocks.append((block['Step'],
+                           block.get('R', 0), block.get('G', 0),
+                           block.get('B', 0), block.get('A', 255)))
+
+    with open(input_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or ':' not in line:
+                continue
+            key, _, val = line.partition(':')
+            key = key.strip()
+            try:
+                ival = int(val.strip())
+            except ValueError:
+                continue
+            if key == 'Step':
+                flush(cur)
+                cur = {'Step': ival}
+            elif key in ('A', 'R', 'G', 'B') and cur is not None:
+                cur[key] = ival
+        flush(cur)
+
+    blocks.sort(key=lambda blk: blk[0])
+    colors = [(r, g, b, a) for (_, r, g, b, a) in blocks]
+    if verbose:
+        print(f"Loaded {len(colors)} step color(s) from {input_file}", file=sys.stderr)
+    return colors
+
+
+def cmd_make_avg(args):
+    """Generate an Android Vector Drawable XML gradient from step colors."""
+    if args.verbose:
+        print(f"Loading step colors from {args.input}", file=sys.stderr)
+
+    colors = load_step_colors(args.input, verbose=args.verbose)
+    if not colors:
+        print(f"Error: no step colors found in {args.input}", file=sys.stderr)
+        sys.exit(1)
+
+    n = len(colors)
+    lines = [AVG_HEAD]
+    if args.range:
+        lo, hi = parse_range(args.range)
+        lines.append(f"          <!-- {_fmt_value(lo)} to {_fmt_value(hi)} -->\n")
+    for i, (r, g, b, a) in enumerate(colors):
+        lines.append(
+            f'        <item android:offset="{fmt_avg_offset(i, n)}" '
+            f'android:color="{fmt_avg_color(r, g, b, a)}"/>\n'
+        )
+    lines.append(AVG_TAIL)
+
+    with open(args.output, 'w') as f:
+        f.write(''.join(lines))
+    print(f"Saved {args.output} ({n} gradient stop(s))")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -536,6 +644,10 @@ def main():
   # Alpha gradient over checkerboard (no CSV needed):
   color-tool.py --alpha
   color-tool.py --alpha -o my_alpha.png
+
+  # Android Vector Drawable XML from Step:/A:/R:/G:/B: input:
+  color-tool.py --make-avg -i vil-colors.txt -o gradient.xml
+  color-tool.py --make-avg -i vil-colors.txt --range -70:130
 
 CSV layouts (--color-values):
   quad  — 4 comma-separated fields: red,green,blue,alpha  (default)
@@ -568,6 +680,10 @@ CSV layouts (--color-values):
         '--alpha', '-a', action='store_true',
         help='Render a white alpha gradient (UL=0%%, LR=100%%) over a checkerboard background',
     )
+    mode_group.add_argument(
+        '--make-avg', dest='make_avg', action='store_true',
+        help='Generate an Android Vector Drawable XML gradient from Step:/A:/R:/G:/B: input',
+    )
 
     parser.add_argument('--input',  '-i', required=False, metavar='FILE',
                         help='Input CSV file (required for --colorboxes and --gradient)')
@@ -593,6 +709,11 @@ CSV layouts (--color-values):
     if args.alpha:
         if args.output is None:
             args.output = 'alpha.png'
+    elif args.make_avg:
+        if args.input is None:
+            parser.error("--input / -i is required for --make-avg")
+        if args.output is None:
+            args.output = os.path.splitext(args.input)[0] + '.xml'
     else:
         if args.input is None:
             parser.error("--input / -i is required for --colorboxes and --gradient")
@@ -606,6 +727,8 @@ CSV layouts (--color-values):
             cmd_gradient(args)
         elif args.alpha:
             cmd_alpha(args)
+        elif args.make_avg:
+            cmd_make_avg(args)
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

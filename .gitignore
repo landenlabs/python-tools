@@ -24,7 +24,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
+tmp/
 .idea/
 
 # PyPI configuration file

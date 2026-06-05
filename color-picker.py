@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import array
 import math
 import os
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from PyQt6.QtGui import (
     QColor,
     QFont,
     QGuiApplication,
+    QIcon,
     QImage,
     QImageReader,
     QIntValidator,
@@ -916,22 +919,29 @@ class AboutDialog(QDialog):
 
 
 def _extract_palette(image: QImage, max_colors: int = 256) -> list[QColor]:
-    """Return up to ``max_colors`` representative colors from ``image``.
+    """Return up to ``max_colors`` most-frequent actual colors from ``image``.
 
-    Uses Qt's built-in quantization via Format_Indexed8, which produces a
-    palette of at most 256 entries — exactly the cap requested for this
-    feature.
+    Builds a pixel-frequency histogram from the raw ARGB32 pixel data and
+    returns colors sorted by popularity (most frequent first).  Large images
+    are scaled to at most 512×512 before scanning so the histogram runs in
+    bounded time while still sampling the full color range of the image.
     """
-    indexed = image.convertToFormat(QImage.Format.Format_Indexed8)
-    seen: set[int] = set()
+    MAX_DIM = 512
+    if image.width() > MAX_DIM or image.height() > MAX_DIM:
+        image = image.scaled(
+            MAX_DIM, MAX_DIM,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    img = image.convertToFormat(QImage.Format.Format_ARGB32)
+    n = img.width() * img.height()
+    ptr = img.bits()
+    ptr.setsize(n * 4)
+    # Each pixel is a 32-bit little-endian uint stored as 0xAARRGGBB (QRgb).
+    pixels = array.array("I", bytes(ptr))
     colors: list[QColor] = []
-    for rgba in indexed.colorTable():
-        if rgba in seen:
-            continue
-        seen.add(rgba)
-        colors.append(QColor.fromRgba(rgba))
-        if len(colors) >= max_colors:
-            break
+    for rgba_int, _ in Counter(pixels).most_common(max_colors):
+        colors.append(QColor.fromRgba(rgba_int))
     return colors
 
 
@@ -1379,6 +1389,9 @@ def main():
     if theme not in ("Light", "Dark"):
         theme = DEFAULT_THEME
     _apply_theme(theme)
+    icon_path = Path(__file__).parent / "color-icon.png"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
