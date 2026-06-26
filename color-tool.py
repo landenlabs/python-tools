@@ -7,11 +7,14 @@
 
 import argparse
 import csv
+import io
+import json
 import os
+import re
 import sys
 import traceback
 
-VERSION = "v1.2 (Apr-2026)"
+VERSION = "v1.3 (Jun-2026)"
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -104,17 +107,181 @@ def parse_packed_value(val_str, unit, layout):
         return b1, b2, b3, b0   # r, g, b, a  (a was b0)
 
 
+
+def _extract_java_numbers(text, is_float):
+    """Extract numeric values from a Java array body (strips comments and 'f' suffixes)."""
+    text = re.sub(r'//[^\n]*', '', text)
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    if is_float:
+        tokens = re.findall(r'-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?[fF]?', text)
+        return [float(t.rstrip('fF')) for t in tokens if t.rstrip('fF')]
+    else:
+        tokens = re.findall(r'-?\d+', text)
+        return [int(t) for t in tokens]
+
+
+def expand_gradient_stops(stops_with_steps, verbose=False):
+    """
+    Convert (r, g, b, a, step) stops into a full 256-entry RGBA palette.
+
+    Palette index = round((step - min_step) * 255 / (max_step - min_step))
+    Gaps are filled by linear interpolation; entries outside the keyed range
+    clamp to the nearest stop.
+
+    Returns (palette, offset, scale) where:
+      palette: list of 256 (r, g, b, a) tuples
+      offset:  min_step  — the data value that maps to palette index 0
+      scale:   255 / (max_step - min_step)
+    """
+    steps = [s[4] for s in stops_with_steps]
+    min_step = min(steps)
+    max_step = max(steps)
+    step_range = max_step - min_step
+    if step_range == 0:
+        raise ValueError("all gradient stops have identical step values")
+
+    scale = 255.0 / step_range
+
+    def _to_pos(step):
+        return max(0, min(255, int((step - min_step) * scale + 0.5)))
+
+    keyed = []
+    for r, g, b, a, step in stops_with_steps:
+        keyed.append((_to_pos(step), r, g, b, a))
+    keyed.sort(key=lambda x: x[0])
+
+    if verbose:
+        print(f"  Palette: offset={min_step:.4g}, scale={scale:.6g}  "
+              f"[{min_step:.4g} : {max_step:.4g}] → [0 : 255]", file=sys.stderr)
+        print(f"  {'#':>4}  {'step':>10}  {'pos':>3}   {'red':>3} {'grn':>3} {'blu':>3} {'alpha':>5}",
+              file=sys.stderr)
+        for i, (r, g, b, a, step) in enumerate(stops_with_steps):
+            print(f"  {i:4d}  {step:10.4g}  {_to_pos(step):3d}   {r:3d} {g:3d} {b:3d} {a:3d}",
+                  file=sys.stderr)
+
+    palette = [None] * 256
+    for pos, r, g, b, a in keyed:
+        palette[pos] = (r, g, b, a)
+
+    # Clamp-extend below the first and above the last keyed position
+    first_pos, first_c = keyed[0][0], keyed[0][1:5]
+    last_pos,  last_c  = keyed[-1][0], keyed[-1][1:5]
+    for i in range(0, first_pos):
+        palette[i] = first_c
+    for i in range(last_pos + 1, 256):
+        palette[i] = last_c
+
+    # Linear-interpolate interior gaps
+    prev_i, prev_c = 0, palette[0]
+    for i in range(1, 256):
+        if palette[i] is not None:
+            if i > prev_i + 1:
+                r0, g0, b0, a0 = prev_c
+                r1, g1, b1, a1 = palette[i]
+                span = i - prev_i
+                for j in range(prev_i + 1, i):
+                    t = (j - prev_i) / span
+                    palette[j] = (
+                        round(r0 + (r1 - r0) * t),
+                        round(g0 + (g1 - g0) * t),
+                        round(b0 + (b1 - b0) * t),
+                        round(a0 + (a1 - a0) * t),
+                    )
+            prev_i, prev_c = i, palette[i]
+
+    return palette, min_step, scale
+
+
 def load_colors(input_file, unit, color_values, verbose=False):
     """
-    Load RGBA colors from CSV. Returns list of (r, g, b, a) tuples (0-255).
-    unit:         'hex' | 'dec'             — numeric base of values
-    color_values: 'quad' | 'rgba' | 'argb' — CSV layout
+    Load RGBA colors from a file. Returns list of (r, g, b, a) tuples (0-255).
+
+    Auto-detects input format:
+      Format 1 — 4-col CSV:    red,green,blue,alpha  (int 0-255)
+      Format 2 — Java int[]:   same as Format 1; skips to 'int[]'  (.java files)
+      Format 3 — 5-col CSV:    red,green,blue,alpha,step; expands to 256-entry palette
+      Format 4 — Java float[]: same as Format 3; skips to 'float[]'  (.java files)
+
+    For Formats 3/4 the returned list is always 256 entries (full interpolated palette).
+    unit:         'hex' | 'dec'
+    color_values: 'quad' | 'rgba' | 'argb'
     """
-    colors = []
-    addHeader = True
     packed = color_values in ('rgba', 'argb')
+    is_java = os.path.splitext(input_file)[1].lower() == '.java'
+
     with open(input_file, newline='') as f:
-        reader = csv.reader(f)
+        content = f.read()
+
+    # ── Java array mode ──────────────────────────────────────────────────────
+    if is_java and not packed:
+        m_float = re.search(r'float\s*\[\s*\]', content)
+        m_int   = re.search(r'int\s*\[\s*\]',   content)
+
+        if m_float and (not m_int or m_float.start() <= m_int.start()):
+            java_type  = 'float'
+            body_start = m_float.end()
+        elif m_int:
+            java_type  = 'int'
+            body_start = m_int.end()
+        else:
+            print("Warning: .java file has no 'int[]' or 'float[]'; parsing entire file.", file=sys.stderr)
+            java_type  = 'int'
+            body_start = 0
+
+        body = content[body_start:]
+        brace = body.find('{')
+        if brace >= 0:
+            body = body[brace + 1:]
+            end  = body.find('}')
+            if end >= 0:
+                body = body[:end]
+
+        if verbose:
+            print(f"Java {java_type}[] detected.", file=sys.stderr)
+
+        numbers = _extract_java_numbers(body, java_type == 'float')
+        stride  = 5 if java_type == 'float' else 4
+
+        if len(numbers) % stride != 0 and verbose:
+            print(f"Warning: {len(numbers)} values not evenly divisible by {stride}; "
+                  f"trailing values ignored.", file=sys.stderr)
+
+        stops_with_steps = []
+        plain_colors     = []
+        for i in range(0, (len(numbers) // stride) * stride, stride):
+            r, g, b, a = int(numbers[i]), int(numbers[i+1]), int(numbers[i+2]), int(numbers[i+3])
+            if stride == 5:
+                stops_with_steps.append((r, g, b, a, numbers[i + 4]))
+            else:
+                plain_colors.append((r, g, b, a))
+
+        if verbose and plain_colors:
+            print("#  Entry    red  green   blue   alpha", file=sys.stderr)
+            for idx, (r, g, b, a) in enumerate(plain_colors):
+                print(f"  {idx+1:4d}:  {r:3d}/{r:2x} {g:3d}/{g:2x} "
+                      f"{b:3d}/{b:2x} {a:3d}/{a:2x}/{a/255:.2f}%", file=sys.stderr)
+
+        if stops_with_steps:
+            if len(stops_with_steps) < 2:
+                print("Warning: need at least 2 gradient stops for expansion.", file=sys.stderr)
+                return []
+            palette, offset, scale = expand_gradient_stops(stops_with_steps, verbose=verbose)
+            if verbose:
+                print(f"Expanded {len(stops_with_steps)} stops → {len(palette)} palette entries "
+                      f"(offset={offset:.4g}, scale={scale:.6g})", file=sys.stderr)
+            return palette
+
+        if verbose:
+            print(f"Loaded {len(plain_colors)} color(s) from {input_file}", file=sys.stderr)
+        return plain_colors
+
+    # ── CSV mode ─────────────────────────────────────────────────────────────
+    stops_with_steps = []
+    plain_colors     = []
+    addHeader        = True
+    use_steps        = None  # determined from first valid data row
+
+    reader = csv.reader(io.StringIO(content))
         for lineno, row in enumerate(reader, 1):
             if not row or row[0].strip().startswith('#'):
                 continue
@@ -123,6 +290,29 @@ def load_colors(input_file, unit, color_values, verbose=False):
                     if not row[0].strip():
                         continue
                     r, g, b, a = parse_packed_value(row[0], unit, color_values)
+                plain_colors.append((r, g, b, a))
+                if verbose:
+                    if addHeader:
+                        print("#  Line     red  green   blue   alpha", file=sys.stderr)
+                        addHeader = False
+                    print(f"  {lineno:4d}:  {r:3d}/{r:2x} {g:3d}/{g:2x} "
+                          f"{b:3d}/{b:2x} {a:3d}/{a:2x}/{a/255:.2f}%", file=sys.stderr)
+            else:
+                if use_steps is None:
+                    use_steps = len(row) >= 5
+                    if verbose and use_steps:
+                        print("Auto-detected 5-column (RGBA + step) format.", file=sys.stderr)
+
+                if use_steps:
+                    if len(row) < 5:
+                        print(f"Warning: line {lineno}: fewer than 5 fields, skipping.", file=sys.stderr)
+                        continue
+                    r    = int(float(row[0].strip()))
+                    g    = int(float(row[1].strip()))
+                    b    = int(float(row[2].strip()))
+                    a    = int(float(row[3].strip()))
+                    step = float(row[4].strip())
+                    stops_with_steps.append((r, g, b, a, step))
                 else:
                     if len(row) < 4:
                         print(f"Warning: line {lineno}: fewer than 4 fields, skipping.", file=sys.stderr)
@@ -131,17 +321,29 @@ def load_colors(input_file, unit, color_values, verbose=False):
                     g = parse_color_value(row[1], unit)
                     b = parse_color_value(row[2], unit)
                     a = parse_color_value(row[3], unit)
-                colors.append((r, g, b, a))
+                    plain_colors.append((r, g, b, a))
                 if verbose:
                     if addHeader:
                         print("#  Line     red  green   blue   alpha", file=sys.stderr)
                         addHeader = False
-                    print(f"  {lineno:4d}:  {r:3d}/{r:2x} {g:3d}/{g:2x} {b:3d}/{b:2x} {a:3d}/{a:2x}/{a / 255:.2f}%", file=sys.stderr)
+                        print(f"  {lineno:4d}:  {r:3d}/{r:2x} {g:3d}/{g:2x} "
+                              f"{b:3d}/{b:2x} {a:3d}/{a:2x}/{a/255:.2f}%", file=sys.stderr)
             except ValueError as e:
                 print(f"Warning: line {lineno}: parse error: {e}, skipping.", file=sys.stderr)
+
+    if stops_with_steps:
+        if len(stops_with_steps) < 2:
+            print("Warning: need at least 2 gradient stops for expansion.", file=sys.stderr)
+            return []
+        palette, offset, scale = expand_gradient_stops(stops_with_steps, verbose=verbose)
+        if verbose:
+            print(f"Expanded {len(stops_with_steps)} stops → {len(palette)} palette entries "
+                  f"(offset={offset:.4g}, scale={scale:.6g})", file=sys.stderr)
+        return palette
+
     if verbose:
-        print(f"Loaded {len(colors)} color(s) from {input_file}", file=sys.stderr)
-    return colors
+        print(f"Loaded {len(plain_colors)} color(s) from {input_file}", file=sys.stderr)
+    return plain_colors
 
 
 def make_box(r, g, b, a, bg, size, checker_sq=5):
@@ -506,6 +708,58 @@ def cmd_alpha(args):
 
 
 # ---------------------------------------------------------------------------
+# --from-json command
+# ---------------------------------------------------------------------------
+
+def cmd_from_json(args):
+    """Convert a JSON color-gradient palette to CSV red,green,blue,alpha,value,label."""
+    with open(args.input) as f:
+        data = json.load(f)
+
+    # Navigate to ColorStep list; handle Palette as object or list
+    try:
+        palettes = data["Palettes"]["Palette"]
+        if isinstance(palettes, list):
+            palette = palettes[0]
+        else:
+            palette = palettes
+        steps = palette["ColorList"]["ColorStep"]
+    except (KeyError, IndexError, TypeError) as e:
+        print(f"Error: unexpected JSON structure: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    rows = []
+    for step in steps:
+        try:
+            value = step["Step"]
+            argb_parts = [int(x.strip()) for x in step["ARGB"].split(",")]
+            if len(argb_parts) == 3:
+                r, g, b, a = argb_parts[0], argb_parts[1], argb_parts[2], 255
+            elif len(argb_parts) == 4:
+                a, r, g, b = argb_parts
+            else:
+                raise ValueError(f"ARGB field does not have 3 or 4 components: {step['ARGB']!r}")
+            label = step.get("Label", "")
+            rows.append((r, g, b, a, value, label))
+        except (KeyError, ValueError) as e:
+            print(f"Warning: skipping step {step!r}: {e}", file=sys.stderr)
+
+    out = open(args.output, 'w', newline='') if args.output else sys.stdout
+    try:
+        writer = csv.writer(out)
+        for r, g, b, a, value, label in rows:
+            writer.writerow([r, g, b, a, value, label])
+    finally:
+        if args.output:
+            out.close()
+
+    if args.output:
+        print(f"Wrote {len(rows)} rows to {args.output}")
+    elif args.verbose:
+        print(f"Wrote {len(rows)} rows to stdout", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # --make-avg command  (Android Vector Drawable gradient)
 # ---------------------------------------------------------------------------
 
@@ -645,6 +899,10 @@ def main():
   color-tool.py --alpha
   color-tool.py --alpha -o my_alpha.png
 
+  # Convert JSON palette to CSV (red,green,blue,alpha,value,label):
+  color-tool.py --from-json -i palette.json
+  color-tool.py --from-json -i palette.json -o palette.csv
+
   # Android Vector Drawable XML from Step:/A:/R:/G:/B: input:
   color-tool.py --make-avg -i vil-colors.txt -o gradient.xml
   color-tool.py --make-avg -i vil-colors.txt --range -70:130
@@ -681,6 +939,11 @@ CSV layouts (--color-values):
         help='Render a white alpha gradient (UL=0%%, LR=100%%) over a checkerboard background',
     )
     mode_group.add_argument(
+        '--from-json', action='store_true',
+        help='Convert a JSON color-gradient palette to CSV (red,green,blue,alpha,value,label)',
+    )
+
+    mode_group.add_argument(
         '--make-avg', dest='make_avg', action='store_true',
         help='Generate an Android Vector Drawable XML gradient from Step:/A:/R:/G:/B: input',
     )
@@ -709,6 +972,10 @@ CSV layouts (--color-values):
     if args.alpha:
         if args.output is None:
             args.output = 'alpha.png'
+    elif args.from_json:
+        if args.input is None:
+            parser.error("--input / -i is required for --from-json")
+        # --output is optional; defaults to stdout
     elif args.make_avg:
         if args.input is None:
             parser.error("--input / -i is required for --make-avg")
@@ -727,6 +994,8 @@ CSV layouts (--color-values):
             cmd_gradient(args)
         elif args.alpha:
             cmd_alpha(args)
+        elif args.from_json:
+            cmd_from_json(args)
         elif args.make_avg:
             cmd_make_avg(args)
     except FileNotFoundError as e:
