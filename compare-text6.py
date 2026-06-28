@@ -27,6 +27,8 @@ import re
 import argparse
 import difflib
 from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QToolBar, QFileDialog, QScrollArea,
@@ -35,7 +37,10 @@ from PyQt6.QtWidgets import (
     QTabWidget, QFormLayout, QSpinBox, QFontComboBox,
 )
 from PyQt6.QtCore import Qt, QSize, pyqtSignal, QRect, QPoint, QSettings
-from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QFontMetrics, QKeySequence
+from PyQt6.QtGui import (
+    QAction, QColor, QFont, QFontMetrics, QImageReader, QKeySequence,
+    QMovie, QPainter, QPixmap,
+)
 
 
 # ── Application metadata (shown in Settings ▸ About) ───────────────────────────
@@ -581,6 +586,42 @@ class PasteDialog(QDialog):
         return self.edit.toPlainText().splitlines()
 
 
+# ── About dialog helpers ──────────────────────────────────────────────────────
+
+_ABOUT_DIALOG_WIDTH = 420
+_ANIM_MAX_W = _ABOUT_DIALOG_WIDTH - 32
+
+
+def _build_date() -> str:
+    try:
+        return datetime.fromtimestamp(
+            os.path.getmtime(Path(__file__))
+        ).strftime("%Y-%m-%d")
+    except OSError:
+        return "unknown"
+
+
+def _bold_label(text: str) -> QLabel:
+    lbl = QLabel(text)
+    f = lbl.font()
+    f.setBold(True)
+    lbl.setFont(f)
+    return lbl
+
+
+def _animation_path() -> Path:
+    return Path(__file__).parent / "screens" / "landenlabs_400.webp"
+
+
+def _animation_display_size(path: Path) -> QSize:
+    """Return display size that preserves the animation's native aspect ratio."""
+    native = QImageReader(str(path)).size()
+    if not native.isValid() or native.width() == 0:
+        return QSize(_ANIM_MAX_W, _ANIM_MAX_W)
+    scale = min(1.0, _ANIM_MAX_W / native.width())
+    return QSize(int(native.width() * scale), int(native.height() * scale))
+
+
 # ── Settings dialog ───────────────────────────────────────────────────────────
 
 class SettingsDialog(QDialog):
@@ -597,10 +638,17 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         self.resize(460, 380)
 
+        # Animation state (used by About tab)
+        self._movie: QMovie | None = None
+        self._anim_label: QLabel | None = None
+        self._anim_final_pixmap: QPixmap | None = None
+        self._last_anim_frame: int = -1
+
         lay = QVBoxLayout(self)
         tabs = QTabWidget()
         tabs.addTab(self._build_appearance_tab(appearance), "Appearance")
         tabs.addTab(self._build_about_tab(), "About")
+        tabs.currentChanged.connect(self._on_tab_changed)
         lay.addWidget(tabs)
 
         btns = QDialogButtonBox(
@@ -650,28 +698,84 @@ class SettingsDialog(QDialog):
 
     def _build_about_tab(self) -> QWidget:
         w = QWidget()
-        lay = QVBoxLayout(w)
-        html = (
-            f"<h2 style='margin-bottom:2px;'>Compare Tool</h2>"
-            f"<p style='color:#666; margin-top:0;'>Side-by-side text comparison "
-            f"with LCS alignment.</p>"
-            f"<table cellspacing='6'>"
-            f"<tr><td><b>Version</b></td><td>{VERSION}</td></tr>"
-            f"<tr><td><b>Author</b></td><td>{AUTHOR}</td></tr>"
-            f"<tr><td><b>GitHub</b></td>"
-            f"<td><a href='{GITHUB_URL}'>{GITHUB_URL}</a></td></tr>"
-            f"<tr><td><b>License</b></td><td>{LICENSE}</td></tr>"
-            f"</table>"
-            f"<p style='color:#666;'>{ATTRIBUTION}</p>"
+        root = QVBoxLayout(w)
+        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        # Animated logo (plays once, then freezes on the last frame).
+        anim_path = _animation_path()
+        if anim_path.exists():
+            display_size = _animation_display_size(anim_path)
+            self._anim_label = QLabel()
+            self._anim_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._anim_label.setFixedSize(display_size)
+            self._movie = QMovie(str(anim_path))
+            self._movie.setScaledSize(display_size)
+            self._anim_label.setMovie(self._movie)
+            self._movie.frameChanged.connect(self._on_anim_frame_changed)
+            root.addWidget(self._anim_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        name_font = QFont()
+        name_font.setPointSize(15)
+        name_font.setBold(True)
+        name_lbl = QLabel("Compare Tool")
+        name_lbl.setFont(name_font)
+        root.addWidget(name_lbl)
+
+        desc = QLabel(
+            f"v{VERSION}  —  Side-by-side text comparison with LCS alignment."
         )
-        lbl = QLabel(html)
-        lbl.setTextFormat(Qt.TextFormat.RichText)
-        lbl.setOpenExternalLinks(True)
-        lbl.setWordWrap(True)
-        lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        lay.addWidget(lbl)
-        lay.addStretch()
+        desc.setWordWrap(True)
+        root.addWidget(desc)
+
+        root.addSpacing(4)
+
+        form = QFormLayout()
+        form.setSpacing(5)
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        form.addRow(_bold_label("Author:"), QLabel(AUTHOR))
+        form.addRow(_bold_label("Built:"),  QLabel(_build_date()))
+        form.addRow(QLabel(""), QLabel("Created by LanDen Labs (2026)"))
+
+        link = QLabel(f'<a href="{GITHUB_URL}">{GITHUB_URL}</a>')
+        link.setOpenExternalLinks(True)
+        link.setTextFormat(Qt.TextFormat.RichText)
+        form.addRow(_bold_label("GitHub:"), link)
+
+        form.addRow(_bold_label("License:"), QLabel(LICENSE))
+
+        root.addLayout(form)
+        root.addStretch()
         return w
+
+    def _on_tab_changed(self, index: int):
+        """Restart the animation whenever the About tab is shown."""
+        if self._movie is None or self._anim_label is None:
+            return
+        # About tab is always index 1
+        if index == 1:
+            self._last_anim_frame = -1
+            self._anim_final_pixmap = None
+            # Re-attach movie in case it was replaced with a static pixmap
+            self._anim_label.setMovie(self._movie)
+            self._movie.start()
+        else:
+            self._movie.stop()
+
+    def _on_anim_frame_changed(self, frame_num: int):
+        """Play the animation once then freeze on the last frame."""
+        if self._movie is None:
+            return
+        if frame_num == 0 and self._last_anim_frame > 0:
+            self._movie.stop()
+            if self._anim_final_pixmap is not None and self._anim_label is not None:
+                self._anim_label.setMovie(None)
+                self._anim_label.setPixmap(self._anim_final_pixmap)
+            return
+        self._anim_final_pixmap = self._movie.currentPixmap()
+        self._last_anim_frame = frame_num
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
