@@ -26,12 +26,12 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QSpinBox, QComboBox, QCheckBox, QFileDialog,
         QAbstractScrollArea, QSizePolicy, QFrame, QDialog, QLineEdit,
-        QScrollArea, QFormLayout,
+        QScrollArea, QFormLayout, QToolTip,
     )
     from PyQt5.QtCore import Qt, pyqtSignal, QRect
     from PyQt5.QtGui import (
         QFont, QFontMetrics, QPainter, QColor, QPen, QImage, QPixmap,
-        QIntValidator,
+        QIntValidator, QCursor,
     )
 except ImportError:
     try:
@@ -39,12 +39,12 @@ except ImportError:
             QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
             QLabel, QPushButton, QSpinBox, QComboBox, QCheckBox, QFileDialog,
             QAbstractScrollArea, QSizePolicy, QFrame, QDialog, QLineEdit,
-            QScrollArea, QFormLayout,
+            QScrollArea, QFormLayout, QToolTip,
         )
         from PyQt6.QtCore import Qt, pyqtSignal, QRect
         from PyQt6.QtGui import (
             QFont, QFontMetrics, QPainter, QColor, QPen, QImage, QPixmap,
-            QIntValidator,
+            QIntValidator, QCursor,
         )
         # PyQt6 renamed enums — wire compat aliases onto the Qt/class objects
         Qt.AlignLeft            = Qt.AlignmentFlag.AlignLeft
@@ -60,6 +60,7 @@ except ImportError:
         QSizePolicy.Fixed       = QSizePolicy.Policy.Fixed
         QFrame.VLine            = QFrame.Shape.VLine
         QImage.Format_Indexed8  = QImage.Format.Format_Indexed8
+        QImage.Format_RGBA8888  = QImage.Format.Format_RGBA8888
         _QT_EXEC = "exec"
     except ImportError:
         print("Error: PyQt5 or PyQt6 required.  Install: pip install PyQt5", file=sys.stderr)
@@ -192,21 +193,52 @@ class BitUnpacker:
                 vals.append(self._finish((acc >> (j * W)) & mask))
         return vals
 
-    def decode_samples(self, data, byte_off, count):
-        """Decode `count` samples sequentially, starting at the base-block
-        boundary at/just below byte_off. Returns (values, actual_start_byte)."""
+    def decode_samples(self, data, byte_off, count, skip=0):
+        """Decode `count` samples starting at the base-block boundary at/just
+        below byte_off. Returns (values, actual_start_byte, end_byte) where
+        end_byte is the byte just past the consumed data (where the next image
+        should begin).
+
+        `skip` (>= 0) drops that many samples between each kept value: take a
+        value, step one, add `skip` to reach the next kept value (stride =
+        skip + 1). skip=0 yields consecutive samples."""
+        step = max(1, int(skip) + 1)
+        raw = count * step
         bb, _ = self.base_block()
         start = max(0, (byte_off // bb) * bb)
         if self.mode == 'native':
-            seg = data[start:start + count]
+            seg = data[start:start + raw]
             vals = [self._finish(b) if self.signed else b for b in seg]
-            return vals, start
+            end = min(start + len(seg), len(data))
+            return vals[::step][:count], start, end
         out = []
         pos = start
-        while len(out) < count and pos < len(data):
+        while len(out) < raw and pos < len(data):
             out.extend(self._block_values(data[pos:pos + bb]))
             pos += bb
-        return out[:count], start
+        return out[:raw][::step][:count], start, min(pos, len(data))
+
+    def sample_span(self, count, skip=0):
+        """Bytes a full image of `count` samples (with `skip`) consumes,
+        independent of file length. Used to count/index whole chunks."""
+        step = max(1, int(skip) + 1)
+        raw = count * step
+        bb, bs = self.base_block()
+        if self.mode == 'native':
+            return raw
+        blocks = (raw + bs - 1) // bs   # whole base blocks needed
+        return blocks * bb
+
+    def sample_byte_offset(self, start, raw_index):
+        """Byte offset where raw sample `raw_index` begins, counting from the
+        block-aligned byte `start`."""
+        W = self.bit_width
+        if self.mode == 'native':
+            return start + raw_index
+        if self.mode == 'grouped':
+            g, within = divmod(raw_index, self.samples_per_group)
+            return start + g * self.group_bytes + (within * W) // 8
+        return start + (raw_index * W) // 8   # continuous
 
     # -- formatting --------------------------------------------------------
 
@@ -511,66 +543,243 @@ def rainbow_palette(n=256):
     return out
 
 
+class ImageCanvas(QWidget):
+    """Displays a QImage scaled to fill the widget while keeping aspect ratio,
+    and reports the image pixel under the mouse (click and hover)."""
+
+    hovered = pyqtSignal(int, int)   # image x, y  (-1, -1 when off the image)
+    clicked = pyqtSignal(int, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._img = None
+        self._src_w = 0            # sample-grid dimensions for coord mapping
+        self._src_h = 0
+        self._mappable = False     # data image maps to samples; histogram not
+        self._disp = QRect()       # rect the image is painted into
+        self.setMouseTracking(True)
+        self.setMinimumSize(80, 80)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_image(self, img, src_w=0, src_h=0, mappable=False):
+        self._img = img
+        self._src_w = src_w
+        self._src_h = src_h
+        self._mappable = bool(mappable) and src_w > 0 and src_h > 0
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.fillRect(self.rect(), C_BG)
+        if self._img is not None and not self._img.isNull():
+            iw, ih = self._img.width(), self._img.height()
+            if iw and ih:
+                scale = min(self.width() / iw, self.height() / ih)
+                dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+                dx, dy = (self.width() - dw) // 2, (self.height() - dh) // 2
+                self._disp = QRect(dx, dy, dw, dh)
+                p.drawImage(self._disp, self._img)
+        p.end()
+
+    def _pt(self, ev):
+        pos = ev.position().toPoint() if hasattr(ev, "position") else ev.pos()
+        return pos
+
+    def _img_xy(self, pos):
+        if (not self._mappable or self._disp.isEmpty()
+                or not self._disp.contains(pos)):
+            return -1, -1
+        fx = (pos.x() - self._disp.x()) / self._disp.width()
+        fy = (pos.y() - self._disp.y()) / self._disp.height()
+        x = min(max(0, int(fx * self._src_w)), self._src_w - 1)
+        y = min(max(0, int(fy * self._src_h)), self._src_h - 1)
+        return x, y
+
+    def mouseMoveEvent(self, ev):
+        x, y = self._img_xy(self._pt(ev))
+        self.hovered.emit(x, y)
+
+    def mousePressEvent(self, ev):
+        if ev.button() != Qt.LeftButton:
+            return
+        x, y = self._img_xy(self._pt(ev))
+        if x >= 0:
+            self.clicked.emit(x, y)
+
+
 class ImageDialog(QDialog):
     """Render a W x H block of decoded samples as an 8-bit indexed PNG image."""
 
-    def __init__(self, view, parent=None):
+    def __init__(self, view, parent=None, owner=None):
         super().__init__(parent)
         self.view = view
-        self.setWindowTitle("Image from decoded samples")
+        self.owner = owner            # MainWindow: holds remembered settings
         self.resize(560, 620)
         self._palette = rainbow_palette(256)
         self._buf = None   # keep QImage backing bytes alive
         self._img = None
 
+        # Remembered defaults (persist across dialogs while the program runs)
+        s = owner.img_settings if owner is not None else {}
+        def_w = int(s.get("width", 64))
+        def_h = int(s.get("height", 64))
+        def_skip = int(s.get("skip", 0))
+        def_auto = bool(s.get("autoscale", False))
+        def_single = bool(s.get("single", False))
+
         lay = QVBoxLayout(self)
-        row = QHBoxLayout()
+        row1 = QHBoxLayout()
+        row2 = QHBoxLayout()
         iv = QIntValidator(1, 100000, self)
         ov = QIntValidator(0, 1 << 30, self)
 
-        def field(label, validator, value):
-            row.addWidget(QLabel(label))
+        def field(target, label, validator, value):
+            target.addWidget(QLabel(label))
             e = QLineEdit(str(value))
             e.setValidator(validator)
             e.setFixedWidth(80)
-            row.addWidget(e)
+            target.addWidget(e)
             return e
 
-        self.w_edit = field("Width:", iv, 64)
-        self.h_edit = field("Height:", iv, 64)
+        # Row 1: geometry / source
+        self.w_edit = field(row1, "Width:", iv, def_w)
+        self.h_edit = field(row1, "Height:", iv, def_h)
         off = view.sel_byte if view.sel_byte is not None else 0
-        self.off_edit = field("Offset:", ov, off)
+        self.off_edit = field(row1, "Offset:", ov, off)
+        self.skip_edit = field(row1, "Skip:", ov, def_skip)
+        self.skip_edit.setToolTip(
+            "Samples skipped between kept values (stride = skip + 1). 0 = consecutive.")
+        row1.addStretch(1)
+        lay.addLayout(row1)
+
+        # Row 2: options / actions
         self.autoscale_cb = QCheckBox("Auto-scale")
         self.autoscale_cb.setToolTip(
             "Scale colors to the window's min/max instead of the full bit range")
+        self.autoscale_cb.setChecked(def_auto)
         self.autoscale_cb.stateChanged.connect(self.draw)
-        row.addWidget(self.autoscale_cb)
+        row2.addWidget(self.autoscale_cb)
+
+        self.single_cb = QCheckBox("Single Viewer")
+        self.single_cb.setToolTip(
+            "Reuse this one image window: pressing Image again re-points it at "
+            "the current selection and redraws instead of opening a new window.")
+        self.single_cb.setChecked(def_single)
+        self.single_cb.stateChanged.connect(self._on_single_toggled)
+        row2.addWidget(self.single_cb)
+
         draw = QPushButton("Draw")
         draw.clicked.connect(self.draw)
-        row.addWidget(draw)
-        row.addStretch(1)
-        lay.addLayout(row)
+        row2.addWidget(draw)
+
+        self.prev_btn = QPushButton("◀")
+        self.prev_btn.setToolTip(
+            "Previous: step the offset back by one image and draw the block "
+            "just before the current one.")
+        self.prev_btn.clicked.connect(self.draw_prev)
+        row2.addWidget(self.prev_btn)
+
+        self.next_btn = QPushButton("▶")
+        self.next_btn.setToolTip(
+            "Next: advance the offset to where the current image ended and "
+            "draw the following block.")
+        self.next_btn.clicked.connect(self.draw_next)
+        row2.addWidget(self.next_btn)
+
+        self.pos_lbl = QLabel("0 of 0")
+        self.pos_lbl.setToolTip(
+            "Current image chunk position of the total whole chunks in the "
+            "file (partial trailing chunk excluded).")
+        row2.addWidget(self.pos_lbl)
+        row2.addStretch(1)
+        lay.addLayout(row2)
+
+        self._last_start = None   # block-aligned start of the last drawn image
+        self._last_end = None     # byte just past the last drawn image
+
+        # Remember changes to width/height/skip while the program runs
+        self.w_edit.textChanged.connect(self._save_settings)
+        self.h_edit.textChanged.connect(self._save_settings)
+        self.skip_edit.textChanged.connect(self._save_settings)
 
         self.info = QLabel("")
         lay.addWidget(self.info)
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.img_label = QLabel("(press Draw)")
-        self.img_label.setAlignment(Qt.AlignCenter)
-        self.scroll.setWidget(self.img_label)
-        lay.addWidget(self.scroll, 1)
+        self.canvas = ImageCanvas()
+        self.canvas.hovered.connect(self._on_hover)
+        self.canvas.clicked.connect(self._on_click)
+        lay.addWidget(self.canvas, 1)
 
+        # Pixel readout (updated on click), under the image / above the buttons
+        self.pixel_lbl = QLabel("Click the image to inspect a pixel.")
+        lay.addWidget(self.pixel_lbl)
+
+        # Current data-image context for pixel -> offset/value mapping
+        self._px_w = self._px_h = self._px_start = self._px_skip = 0
+        self._px_values = None
+
+        bottom = QHBoxLayout()
+        self.hist_cb = QCheckBox("Histogram")
+        self.hist_cb.setToolTip(
+            "Show a histogram of the decoded sample values instead of the image.")
+        self.hist_cb.stateChanged.connect(self.draw)
+        bottom.addWidget(self.hist_cb, 1)
         save = QPushButton("Save PNG…")
         save.clicked.connect(self.save_png)
-        lay.addWidget(save)
+        bottom.addWidget(save, 1)
+        lay.addLayout(bottom)
 
+        self._update_title()
         self.draw()
 
-    def _make_image(self, w, h, offset, autoscale):
+    # -- single-viewer / remembered-settings plumbing ---------------------
+
+    def _file_label(self):
+        path = getattr(self.owner, "_path", None) if self.owner is not None else None
+        if not path:
+            return "(no file)"
+        name = os.path.basename(path)
+        return name if len(name) <= 40 else name[:37] + "…"
+
+    def _update_title(self):
+        self.setWindowTitle("Image of %s" % self._file_label())
+
+    def set_offset(self, offset):
+        self.off_edit.setText(str(int(offset)))
+
+    def _save_settings(self, *_):
+        if self.owner is None:
+            return
+        try:
+            w = int(self.w_edit.text() or 0)
+            h = int(self.h_edit.text() or 0)
+            skip = int(self.skip_edit.text() or 0)
+        except ValueError:
+            return
+        s = self.owner.img_settings
+        if w > 0:
+            s["width"] = w
+        if h > 0:
+            s["height"] = h
+        s["skip"] = max(0, skip)
+        s["autoscale"] = self.autoscale_cb.isChecked()
+        s["single"] = self.single_cb.isChecked()
+
+    def _on_single_toggled(self, *_):
+        if self.owner is not None:
+            self.owner.register_single_dialog(
+                self if self.single_cb.isChecked() else None)
+        self._save_settings()
+
+    def closeEvent(self, ev):
+        if self.owner is not None and self.owner._img_dialog is self:
+            self.owner.register_single_dialog(None)
+        super().closeEvent(ev)
+
+    def _make_image(self, w, h, offset, autoscale, skip=0):
         up = self.view.unpacker
         data = self.view.data
-        values, start = up.decode_samples(data, offset, w * h)
+        values, start, end = up.decode_samples(data, offset, w * h, skip=skip)
         mask = (1 << up.bit_width) - 1
         n = len(values)
         if autoscale and n:
@@ -586,35 +795,167 @@ class ImageDialog(QDialog):
             buf[(i // w) * bpl + (i % w)] = 0 if idx < 0 else (255 if idx > 255 else idx)
         img = QImage(bytes(buf), w, h, bpl, QImage.Format_Indexed8)
         img.setColorTable([QColor(r, g, b).rgb() for (r, g, b) in self._palette])
-        return img, buf, start, n, vmin, vmax
+        return img, buf, start, n, vmin, vmax, end, values
+
+    def _make_histogram(self, values):
+        """Histogram of the decoded values. Uses matplotlib if present,
+        otherwise a simple QPainter fallback. Returns QImage/QPixmap or None."""
+        if not values:
+            return None
+        vmin, vmax = min(values), max(values)
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+        except ImportError:
+            return self._histogram_qpainter(values, vmin, vmax)
+        fig = Figure(figsize=(5.12, 4.0), dpi=100)
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        ax.hist(values, bins=256, color='steelblue', edgecolor='none')
+        ax.set_xlabel('Value')
+        ax.set_ylabel('Count')
+        ax.set_title('n=%d  [%g, %g]' % (len(values), vmin, vmax))
+        fig.tight_layout()
+        canvas.draw()
+        buf = canvas.buffer_rgba()
+        w, h = canvas.get_width_height()
+        qi = QImage(bytes(buf), w, h, w * 4, QImage.Format_RGBA8888)
+        return qi.copy()
+
+    def _histogram_qpainter(self, values, vmin, vmax):
+        """Dependency-free 256-bin bar histogram drawn onto a QPixmap."""
+        W, H, bins = 512, 400, 256
+        ml, mr, mt, mb = 55, 12, 26, 40
+        span = (vmax - vmin) or 1
+        counts = [0] * bins
+        for v in values:
+            b = (v - vmin) * (bins - 1) // span
+            counts[0 if b < 0 else (bins - 1 if b >= bins else b)] += 1
+        peak = max(counts) or 1
+        plot_w, plot_h = W - ml - mr, H - mt - mb
+
+        pm = QPixmap(W, H)
+        pm.fill(QColor(255, 255, 255))
+        p = QPainter(pm)
+        bar = QColor(70, 130, 180)   # steelblue
+        for i, c in enumerate(counts):
+            bh = c * plot_h // peak
+            x0 = ml + i * plot_w // bins
+            x1 = ml + (i + 1) * plot_w // bins
+            if bh:
+                p.fillRect(x0, H - mb - bh, max(1, x1 - x0), bh, bar)
+        p.setPen(QColor(0, 0, 0))
+        p.drawLine(ml, mt, ml, H - mb)              # y axis
+        p.drawLine(ml, H - mb, W - mr, H - mb)      # x axis
+        p.drawText(ml, mt - 8,
+                   "n=%d  [%g, %g]   Value →  (Count ↑)"
+                   % (len(values), vmin, vmax))
+        p.end()
+        return pm
 
     def draw(self):
         try:
             w = int(self.w_edit.text() or 0)
             h = int(self.h_edit.text() or 0)
             offset = int(self.off_edit.text() or 0)
+            skip = max(0, int(self.skip_edit.text() or 0))
         except ValueError:
             return
         if w <= 0 or h <= 0 or not self.view.data:
             self.info.setText("Enter width, height (>0) and load a file.")
             return
+        self._update_title()
+        self._save_settings()
         autoscale = self.autoscale_cb.isChecked()
-        img, buf, start, n, vmin, vmax = self._make_image(w, h, offset, autoscale)
+        img, buf, start, n, vmin, vmax, end, values = self._make_image(
+            w, h, offset, autoscale, skip=skip)
         self._img = img
         self._buf = buf   # must outlive the QImage
+        self._last_start = start   # block-aligned start of this image
+        self._last_end = end       # where the next image should begin
+
+        # Save context for pixel -> offset/value mapping
+        self._px_w, self._px_h = w, h
+        self._px_start, self._px_skip = start, skip
+        self._px_values = values
+
+        # Chunk position "n of nn" (whole chunks only, partial tail ignored)
+        span = self.view.unpacker.sample_span(w * h, skip)
+        total = len(self.view.data) // span if span else 0
+        pos = (start // span + 1) if span else 0
+        self.pos_lbl.setText("%d of %d" % (min(pos, total) if total else 0, total))
         self.info.setText(
-            "%d x %d = %d samples   from byte 0x%X (%d)   got %d   range %d..%d%s"
-            % (w, h, w * h, start, start, n, vmin, vmax,
+            "%d x %d = %d samples   from byte 0x%X (%d)   skip %d   got %d   next 0x%X   range %d..%d%s"
+            % (w, h, w * h, start, start, skip, n, end, vmin, vmax,
                "  (auto)" if autoscale else ""))
-        pm = QPixmap.fromImage(img)
-        # upscale small images with crisp nearest-neighbor, cap display size
-        disp = 512
-        if max(w, h) < disp:
-            scale = disp // max(w, h)
-            pm = pm.scaled(w * scale, h * scale, Qt.KeepAspectRatio,
-                           Qt.FastTransformation)
-        self.img_label.setPixmap(pm)
-        self.img_label.resize(pm.size())
+
+        if self.hist_cb.isChecked():
+            hist = self._make_histogram(values)
+            if hist is not None:
+                self._img = hist   # save the histogram, not the data image
+                qi = hist if isinstance(hist, QImage) else hist.toImage()
+                self.canvas.set_image(qi, mappable=False)   # not pixel-mapped
+                return
+            self.info.setText("No values to histogram.")
+
+        # The canvas scales the image to fill the viewer, keeping aspect ratio
+        self.canvas.set_image(img, src_w=w, src_h=h, mappable=True)
+
+    def _pixel_at(self, x, y):
+        """Return (byte_offset, value) for image pixel (x, y), or None."""
+        if (self._px_values is None or x < 0 or y < 0
+                or x >= self._px_w or y >= self._px_h):
+            return None
+        i = y * self._px_w + x
+        if i >= len(self._px_values):
+            return None
+        raw_index = i * (self._px_skip + 1)
+        off = self.view.unpacker.sample_byte_offset(self._px_start, raw_index)
+        return off, self._px_values[i]
+
+    def _on_click(self, x, y):
+        hit = self._pixel_at(x, y)
+        if hit is None:
+            return
+        off, val = hit
+        mask = (1 << self.view.unpacker.bit_width) - 1
+        self.pixel_lbl.setText(
+            "x=%d  y=%d     offset 0x%X (%d)     value %d (0x%X)"
+            % (x, y, off, off, val, val & mask))
+
+    def _on_hover(self, x, y):
+        hit = self._pixel_at(x, y)
+        if hit is None:
+            QToolTip.hideText()
+            return
+        _, val = hit
+        mask = (1 << self.view.unpacker.bit_width) - 1
+        QToolTip.showText(QCursor.pos(),
+                          "x=%d y=%d  val=%d (0x%X)" % (x, y, val, val & mask),
+                          self.canvas)
+
+    def draw_next(self):
+        """Move the offset to where the last image ended and draw again."""
+        if self._last_end is None:
+            self.draw()
+            return
+        if self._last_end >= len(self.view.data):
+            self.info.setText("End of data — no more samples.")
+            return
+        self.set_offset(self._last_end)
+        self.draw()
+
+    def draw_prev(self):
+        """Step the offset back by one image's span and draw the block before."""
+        if self._last_start is None or self._last_end is None:
+            self.draw()
+            return
+        if self._last_start <= 0:
+            self.info.setText("Start of data — nothing before offset 0.")
+            return
+        span = max(1, self._last_end - self._last_start)
+        self.set_offset(max(0, self._last_start - span))
+        self.draw()
 
     def save_png(self):
         if self._img is None:
@@ -700,6 +1041,13 @@ class MainWindow(QMainWindow):
         self.view = HexView()
         self.view.target_bytes = target_bytes
         self.view.selectionChanged.connect(self._update_status)
+
+        self._path = None            # path of the loaded file, if any
+
+        # Remembered image-dialog settings (persist while the program runs)
+        self.img_settings = {"width": 64, "height": 64, "skip": 0,
+                             "autoscale": False, "single": False}
+        self._img_dialog = None      # the live single-viewer dialog, if any
 
         ctrl = self._build_controls(mode, bit_width, group_bytes,
                                      samples_per_group, bit_order, signed,
@@ -805,8 +1153,27 @@ class MainWindow(QMainWindow):
         h.addWidget(self.about_btn)
         return bar
 
+    def register_single_dialog(self, dlg):
+        """Track (or clear) the dialog that owns single-viewer mode."""
+        self._img_dialog = dlg
+
+    def _current_offset(self):
+        return self.view.sel_byte if self.view.sel_byte is not None else 0
+
     def _on_image(self):
-        dlg = ImageDialog(self.view, self)
+        # Single Viewer: reuse the open window, re-point it at the current
+        # selection, and redraw — instead of opening another window.
+        if self.img_settings.get("single") and self._img_dialog is not None:
+            dlg = self._img_dialog
+            dlg.set_offset(self._current_offset())
+            dlg.draw()
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        dlg = ImageDialog(self.view, self, owner=self)
+        if dlg.single_cb.isChecked():
+            self.register_single_dialog(dlg)
         dlg.show()
 
     def _on_about(self):
