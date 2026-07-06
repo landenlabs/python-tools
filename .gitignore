@@ -6,6 +6,9 @@ build/
 __pycache__/
 .claude/
 .claude/**
+
+.legacy
+.legacy/**
  
 # Translations
 *.mo
