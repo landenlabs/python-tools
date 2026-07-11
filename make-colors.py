@@ -282,14 +282,14 @@ def load_colors(input_file, unit, color_values, verbose=False):
     use_steps        = None  # determined from first valid data row
 
     reader = csv.reader(io.StringIO(content))
-        for lineno, row in enumerate(reader, 1):
-            if not row or row[0].strip().startswith('#'):
-                continue
-            try:
-                if packed:
-                    if not row[0].strip():
-                        continue
-                    r, g, b, a = parse_packed_value(row[0], unit, color_values)
+    for lineno, row in enumerate(reader, 1):
+        if not row or row[0].strip().startswith('#'):
+            continue
+        try:
+            if packed:
+                if not row[0].strip():
+                    continue
+                r, g, b, a = parse_packed_value(row[0], unit, color_values)
                 plain_colors.append((r, g, b, a))
                 if verbose:
                     if addHeader:
@@ -326,10 +326,10 @@ def load_colors(input_file, unit, color_values, verbose=False):
                     if addHeader:
                         print("#  Line     red  green   blue   alpha", file=sys.stderr)
                         addHeader = False
-                        print(f"  {lineno:4d}:  {r:3d}/{r:2x} {g:3d}/{g:2x} "
-                              f"{b:3d}/{b:2x} {a:3d}/{a:2x}/{a/255:.2f}%", file=sys.stderr)
-            except ValueError as e:
-                print(f"Warning: line {lineno}: parse error: {e}, skipping.", file=sys.stderr)
+                    print(f"  {lineno:4d}:  {r:3d}/{r:2x} {g:3d}/{g:2x} "
+                          f"{b:3d}/{b:2x} {a:3d}/{a:2x}/{a/255:.2f}%", file=sys.stderr)
+        except ValueError as e:
+            print(f"Warning: line {lineno}: parse error: {e}, skipping.", file=sys.stderr)
 
     if stops_with_steps:
         if len(stops_with_steps) < 2:
@@ -873,39 +873,39 @@ def cmd_make_avg(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description=f"color-tool {VERSION}\nGenerate PNG color-box, gradient, or alpha images from a CSV of RGBA values.",
+        description=f"make-colors {VERSION}\nGenerate PNG color-box, gradient, or alpha images from a CSV of RGBA values.",
         epilog="""Examples:
   # Color boxes, quad decimal (default):
-  color-tool.py --colorboxes -i colors.csv -o boxes.png
-  color-tool.py --colorboxes -i colors.csv -o boxes.png -v
+  make-colors.py --colorboxes -i colors.csv -o boxes.png
+  make-colors.py --colorboxes -i colors.csv -o boxes.png -v
 
   # Color boxes, quad hex:
-  color-tool.py --colorboxes -i colors.csv -o boxes.png --color-unit hex
+  make-colors.py --colorboxes -i colors.csv -o boxes.png --color-unit hex
 
   # Color boxes, packed rgba hex (e.g. FF0000FF = opaque red):
-  color-tool.py --colorboxes -i colors.csv -o boxes.png --color-values rgba --color-unit hex
+  make-colors.py --colorboxes -i colors.csv -o boxes.png --color-values rgba --color-unit hex
 
   # Color boxes, packed argb hex (e.g. FFFF0000 = opaque red):
-  color-tool.py --colorboxes -i colors.csv -o boxes.png --color-values argb --color-unit hex
+  make-colors.py --colorboxes -i colors.csv -o boxes.png --color-values argb --color-unit hex
 
   # Gradient from CSV stops:
-  color-tool.py --gradient 128 -i stops.csv -o gradient.png --size 16x256
-  color-tool.py --gradient 256 -i stops.csv -o ramp.png --size 256x16
+  make-colors.py --gradient 128 -i stops.csv -o gradient.png --size 16x256
+  make-colors.py --gradient 256 -i stops.csv -o ramp.png --size 256x16
 
   # Gradient with range labels (vertical only):
-  color-tool.py --gradient 256 -i stops.csv -o gradient.png --size 16x256 --range 0.00:0.77
+  make-colors.py --gradient 256 -i stops.csv -o gradient.png --size 16x256 --range 0.00:0.77
 
   # Alpha gradient over checkerboard (no CSV needed):
-  color-tool.py --alpha
-  color-tool.py --alpha -o my_alpha.png
+  make-colors.py --alpha
+  make-colors.py --alpha -o my_alpha.png
 
   # Convert JSON palette to CSV (red,green,blue,alpha,value,label):
-  color-tool.py --from-json -i palette.json
-  color-tool.py --from-json -i palette.json -o palette.csv
+  make-colors.py --from-json -i palette.json
+  make-colors.py --from-json -i palette.json -o palette.csv
 
   # Android Vector Drawable XML from Step:/A:/R:/G:/B: input:
-  color-tool.py --make-avg -i vil-colors.txt -o gradient.xml
-  color-tool.py --make-avg -i vil-colors.txt --range -70:130
+  make-colors.py --make-avg -i vil-colors.txt -o gradient.xml
+  make-colors.py --make-avg -i vil-colors.txt --range -70:130
 
 CSV layouts (--color-values):
   quad  — 4 comma-separated fields: red,green,blue,alpha  (default)
